@@ -95,3 +95,11 @@ gfx950,bf16,8,64,64,1024,16384,False,False,False,dvdk,96,16,2,0,93676.7860000000
 gfx950,bf16,8,64,64,1024,16384,False,False,False,dq,96,16,2,1,64928.43449999999
 gfx950,bf16,8,64,64,1024,16384,False,False,True,dvdk,64,32,2,0,94116.19600000001
 gfx950,bf16,8,64,64,1024,16384,False,False,True,dq,64,16,2,4,69940.5535
+gfx942,bf16,4,64,64,1024,16384,False,False,False,fused,256,16,8,2,387100.0
+gfx942,bf16,4,64,64,1024,16384,False,False,True,fused,256,16,8,2,393200.0
+gfx942,bf16,8,64,64,1024,16384,False,False,False,fused,256,16,8,2,814300.0
+gfx942,bf16,8,64,64,1024,16384,False,False,True,fused,256,16,8,2,817000.0
+gfx942,bf16,4,64,64,120,16384,False,False,False,fused,256,16,8,2,46200.0
+gfx942,bf16,4,64,64,120,16384,False,False,True,fused,256,16,8,2,46400.0
+gfx942,bf16,8,64,64,120,16384,False,False,False,fused,256,16,8,2,93100.0
+gfx942,bf16,8,64,64,120,16384,False,False,True,fused,256,16,8,2,93900.0
