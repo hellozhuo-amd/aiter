@@ -25,9 +25,10 @@ shipping kernel's tuned (128,32,4,2), bf16, sparsity 0.95:
     pp  + vectorize-slp=False     150.9 ms   +3.0%
     pp  staging zero-fold moved   140.6 ms   -3.9%   see async_load_kv_regs
     pp  merged unit stream        132.9 ms   -9.1%   one UNIT_ORDER walk
-    pp  + rolling window          131.3 ms  -10.3%   1.116x
+    pp  + rolling window          131.3 ms  -10.3%
+    pp  + V_ROT_DT cross-phase    130.1 ms  -11.1%   1.123x
 
-and 1.116 / 1.140 / 1.121 / 1.145x over the four benchmark cells (train H=4/H=8,
+and 1.121 / 1.147 / 1.129 / 1.150x over the four benchmark cells (train H=4/H=8,
 infer H=4/H=8). Unlike the backward's fused kernel -- 1.31x at H=4 but 1.17x at
 H=8 -- the win here is flat across cells.
 
@@ -441,14 +442,7 @@ def build_hstu_attention_fwd_pp(
     # issue window with instead of one dependent chain. The compiler finds this
     # on its own today; stating it keeps it true once the rolling window below
     # pins the order. Set to QK-then-PV for the fp8 kernel's sequential form.
-    UNIT_ORDER = [
-        spec
-        for j in range(N_QK_UNITS)
-        for spec in (("qk", j), ("pv", j))
-    ]
-    assert len(UNIT_ORDER) == N_UNITS
-
-    # Rolling operand window, ported from the gfx950 fp8 ping-pong FMHA kernel
+    # V slot rotation, ported from the fp8 kernel's V_ROT_DT (traits.py:141-147).
     # (`op_gemm.py`): the MFMAs at step `s` consume the pack read at step
     # `s - PREFETCH_DEPTH`, so no MFMA ever waits on its own `ds_read`. Each
     # unit is Q_SUBTILES MFMAs ~= Q_SUBTILES*16 cycles, so depth 2 buys roughly
@@ -457,17 +451,16 @@ def build_hstu_attention_fwd_pp(
     # depth 1 / 2 / 3 / 4 / 6 (512,32). Two is the fp8 kernel's choice and the
     # cheapest that ties; past four the window's own registers start costing.
     PREFETCH_DEPTH = 2
-    # NOT chained across the phase barrier, and that is a measured decision.
-    # The fp8 kernel's tail also reads the NEXT phase's first operands, handing
-    # them over in registers. Here that needs a THIRD slot per tensor -- what
-    # the next phase reads is what this phase writes -- plus UNROLL 2 -> 3.
-    # Built and measured: the ISA confirmed it worked (the first MFMA after the
-    # barrier issued with no `s_waitcnt` at all, against `rrr; lgkmcnt(2)`
-    # without it), and it still measured 131.7 ms against 131.3, for +10 VGPR
-    # and +9 KB of LDS. The phase-boundary read latency is simply not on the
-    # critical path: this kernel is VALU-bound, so the MFMA stream has slack to
-    # absorb it. Do not re-derive this from the fp8 source -- it is MFMA-bound,
-    # which is why the chain pays there and not here.
+    # Chained across the phase barrier too -- see XPHASE_DEPTH and V_ROT_DT.
+    #
+    # The naive form of that chain costs a THIRD slot per tensor, because what
+    # the next phase reads is what this phase writes, plus UNROLL 2 -> 3. Built
+    # that way first and measured 131.7 ms against 131.3: the mechanism worked
+    # (the ISA showed the first MFMA after the barrier issuing with no
+    # `s_waitcnt` at all) but +10 VGPR and +9 KB of LDS ate the gain. With the
+    # rotation it costs nothing instead -- VGPRs go DOWN, LDS is unchanged --
+    # and the same mechanism is worth -0.9%. The lesson is that the chain was
+    # never the problem; paying a slot for it was.
     # Ring slots, indexed by STEP and never by unit value: UNIT_ORDER is a
     # permutation, so keying on the unit would let a later unit's read land in a
     # slot whose occupant has not been consumed yet -- silently wrong results.
@@ -475,6 +468,58 @@ def build_hstu_attention_fwd_pp(
     # lookahead, so any depth below RING is correct.
     WIN_RING = 4
     assert 0 <= PREFETCH_DEPTH < WIN_RING <= N_UNITS
+
+    # A V slot is rotated by one d-chunk against the tile grid:
+    #
+    #     vslot p  holds  d-chunks 1..D-1 of tile p   AND   d-chunk 0 of tile p+1
+    #
+    # which is what lets TWO buffers serve three roles. In M(i): PV reads tile
+    # i-1's chunks 1..D-1 out of vslot (i-1)%2, its chunk 0 comes from registers
+    # the previous phase's tail prefetched, and the tail prefetches chunk 0 of
+    # tile i -- which also lives in vslot (i-1)%2. So every read touches the slot
+    # being READ and never the one being written (vslot i%2). Without the
+    # rotation the tail's target IS the slot under write, and the chain costs a
+    # third slot plus UNROLL 2 -> 3.
+    #
+    # Free in the store: the rotation says which TILE a lane loads, not where it
+    # lands, so only the staging load's row gets a per-lane select. See
+    # `kv_stage_tile`.
+    V_ROT_DT = 1
+
+    # The cross-phase head must be d-chunk-0 PV units ONLY. The rotation covers
+    # exactly V_ROT_DT d-chunks, so a QK unit in the head would need K rotated
+    # too -- which the interleaved order would otherwise force, since it
+    # alternates from unit 0. Leading with the chunk-0 PV units keeps the port
+    # to one rotated tensor, exactly as the fp8 kernel has it.
+    XPHASE_DEPTH = PREFETCH_DEPTH
+    _PV_HEAD = [j for j in range(N_PV_UNITS) if (j % D_CHUNKS) < V_ROT_DT]
+    assert len(_PV_HEAD) >= XPHASE_DEPTH, (
+        f"V_ROT_DT={V_ROT_DT} covers {len(_PV_HEAD)} PV units, need {XPHASE_DEPTH}"
+    )
+    _HEAD = [("pv", j) for j in _PV_HEAD[:XPHASE_DEPTH]]
+    # The rest keeps the 1:1 QK/PV alternation. Its only cost is at the head:
+    # the two leading PV units share c=0, so they chain on o_acc[0] two MFMAs
+    # apart. Measured against the alternative of rotating K as well, that is the
+    # cheap side.
+    _REST_PV = [("pv", j) for j in range(N_PV_UNITS) if ("pv", j) not in _HEAD]
+    _REST_QK = [("qk", j) for j in range(N_QK_UNITS)]
+    UNIT_ORDER = _HEAD + [
+        spec for pair in zip(_REST_QK, _REST_PV + [None] * len(_REST_QK))
+        for spec in pair if spec is not None
+    ]
+    assert len(UNIT_ORDER) == N_UNITS, (len(UNIT_ORDER), N_UNITS)
+    assert sorted(UNIT_ORDER) == sorted(
+        [("qk", j) for j in range(N_QK_UNITS)]
+        + [("pv", j) for j in range(N_PV_UNITS)]
+    ), "UNIT_ORDER must be a permutation of the units"
+    # Every cross-phase head unit must be a chunk-0 PV unit, or the rotation
+    # does not cover it.
+    assert all(
+        k == "pv" and (j % D_CHUNKS) < V_ROT_DT
+        for k, j in UNIT_ORDER[:XPHASE_DEPTH]
+    )
+
+    # Rolling operand window, ported from the gfx950 fp8 ping-pong FMHA kernel
 
     @fx.struct
     class SharedStorage:
@@ -752,6 +797,26 @@ def build_hstu_attention_fwd_pp(
         # swizzled K store.
         kv_col_grp = kv_lane_in_row * fx.Int32(VEC_KV // MFMA_DIM_LANE_K)
 
+        # ---- The V slot rotation, as a per-lane tile select -----------------
+        # A lane's VEC_KV contiguous d values all land in ONE d-chunk (VEC_KV
+        # divides MFMA_M), so "which chunk am I staging" is a single per-lane
+        # predicate. Rotated lanes stage the NEXT tile's chunk; everyone else
+        # stages this tile's. That is the whole cost of V_ROT_DT -- the store
+        # destination is untouched, because the rotation changes which tile a
+        # lane reads, not where it writes.
+        kv_rot_lane = (kv_col // fx.Int32(MFMA_M)) < fx.Int32(V_ROT_DT)
+        # g0 stages K, which is NOT rotated, so its bump is always 1.
+        kv_stage_bump = (is_g0 | kv_rot_lane).select(fx.Int32(1), fx.Int32(0))
+
+        def kv_stage_start(kv_tile):
+            """Per-lane byte-row start of the tile this lane stages for `kv_tile`.
+
+            g0: always K(kv_tile + 1). g1: V(kv_tile) for chunks >= V_ROT_DT and
+            V(kv_tile + 1) for the rotated chunks, which is exactly the split
+            `vslot kv_tile % V_SLOTS` is defined to hold.
+            """
+            return (kv_tile + kv_stage_bump) * fx.Int32(BLOCK_N)
+
         def async_load_kv_regs(kv_start):
             """Issue this group's coalesced global load to registers (non-blocking).
 
@@ -919,7 +984,7 @@ def build_hstu_attention_fwd_pp(
                 )
             return o_acc, s_accs
 
-        def mfma_burst(o_acc, p_packs, ks_mem, vs_mem):
+        def mfma_burst(o_acc, p_packs, carried, ks_mem, vs_mem):
             """PHASE M's whole MFMA stream: GEMM1 of this tile merged with GEMM2
             of the previous one, walked as one `UNIT_ORDER` sequence.
 
@@ -940,8 +1005,13 @@ def build_hstu_attention_fwd_pp(
             # holds the pattern: without it the scheduler hoists every read to
             # the head of the phase and the window stops meaning anything.
             win = [None for _ in range_constexpr(WIN_RING)]
-            for s in range_constexpr(PREFETCH_DEPTH):
+            # Seeded from the PREVIOUS phase's tail, so the first MFMA of the
+            # burst issues with nothing outstanding.
+            for s in range_constexpr(XPHASE_DEPTH):
+                win[s % WIN_RING] = carried[s]
+            for s in range_constexpr(XPHASE_DEPTH, PREFETCH_DEPTH):
                 win[s % WIN_RING] = read_unit(UNIT_ORDER[s], ks_mem, vs_mem)
+            nxt = [None for _ in range_constexpr(XPHASE_DEPTH)]
             for step in range_constexpr(N_UNITS):
                 rocdl.sched_barrier(0)
                 o_acc, s_accs = apply_unit(
@@ -952,8 +1022,16 @@ def build_hstu_attention_fwd_pp(
                     win[sn % WIN_RING] = read_unit(
                         UNIT_ORDER[sn], ks_mem, vs_mem
                     )
+                else:
+                    # The tail reads the NEXT phase's first units -- and thanks
+                    # to the rotation, out of the SAME `vs_mem` this phase is
+                    # reading, never the slot being written. That is the whole
+                    # point of V_ROT_DT: no third slot, no extra slot handle.
+                    nxt[sn - N_UNITS] = read_unit(
+                        UNIT_ORDER[sn - N_UNITS], ks_mem, vs_mem
+                    )
                 rocdl.sched_barrier(0)
-            return o_acc, s_accs
+            return o_acc, s_accs, nxt
 
         def gate_tile(kv_start, s_accs, apply_mask=True):
             """PHASE V. Mask + silu gate -> P packs. No memory operation at all.
@@ -1029,7 +1107,7 @@ def build_hstu_attention_fwd_pp(
         N_PACK = KV_SUBTILES * Q_SUBTILES
         c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
-        def mfma_phase(o_acc, p_prev, kv_regs, kv_tile, u):
+        def mfma_phase(o_acc, p_prev, kv_regs, pre, kv_tile, u):
             """PHASE M: both GEMMs, their LDS operand feed, and this group's staging.
 
             Returns (o_acc, s_accs, kv_regs_next). `u` is the sub-trip position,
@@ -1054,7 +1132,9 @@ def build_hstu_attention_fwd_pp(
             # and v_smem[v_prev] its V slot -- the rotation. Tiles still land in
             # the accumulator in ascending order, only one trip later, so this
             # stays bitwise identical to the unrotated kernel.
-            o_acc, s_accs = mfma_burst(o_acc, p_prev, k_smem[k_cur], v_smem[v_prev])
+            o_acc, s_accs, pre_next = mfma_burst(
+                o_acc, p_prev, pre, k_smem[k_cur], v_smem[v_prev]
+            )
 
             # Publish the set issued one phase pair ago, then issue the next.
             # Each group writes ONE tensor, never both: g0's M(i) writes only
@@ -1076,9 +1156,7 @@ def build_hstu_attention_fwd_pp(
             # the wait above. The tile it belongs to is one ahead of this one for
             # g0 (which writes K(i+1)) and this very tile for g1 (which writes
             # V(i)); mirrors the `next_tile` offsets below, shifted by a phase.
-            staged_start = (
-                kv_tile + is_g0.select(fx.Int32(1), fx.Int32(0))
-            ) * fx.Int32(BLOCK_N)
+            staged_start = kv_stage_start(kv_tile)
             kv_vals = kv_zero_fold(kv_regs, staged_start)
             if is_g0:
                 store_k_regs_to_lds(kv_vals, k_smem[k_fill])
@@ -1086,8 +1164,11 @@ def build_hstu_attention_fwd_pp(
                 store_v_regs_to_lds(kv_vals, v_smem[v_cur])
             rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_KV, 0)
 
-            next_tile = kv_tile + is_g0.select(fx.Int32(2), fx.Int32(1))
-            kv_regs_next = async_load_kv_regs(next_tile * fx.Int32(BLOCK_N))
+            # Issued now, ds_written in M(i+1), so it targets M(i+1)'s staged
+            # tile: one further out than this phase's, per lane.
+            kv_regs_next = async_load_kv_regs(
+                kv_stage_start(kv_tile + fx.Int32(1))
+            )
 
             # `phase_barrier` carries no memory fence, so this wait is placed by
             # hand. No `vmcnt` belongs here: the load issued just above lands in
@@ -1098,7 +1179,7 @@ def build_hstu_attention_fwd_pp(
             #                the next trip's writes into the same slots.
             rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.s_setprio(0)
-            return o_acc, s_accs, kv_regs_next
+            return o_acc, s_accs, kv_regs_next, pre_next
 
         def gate_phase(kv_start, s_accs, apply_mask=True):
             """PHASE V: the mask and the SiLU gate. No memory operation at all."""
@@ -1126,10 +1207,12 @@ def build_hstu_attention_fwd_pp(
             scf.for boundary.
             """
             it_list = list(it) if isinstance(it, (list, tuple)) else [it]
+            _pre = N_ACC + N_PACK + NUM_BATCHES_KV
             return (
                 [it_list[i] for i in range_constexpr(N_ACC)],
                 unflatten([it_list[N_ACC + i] for i in range_constexpr(N_PACK)]),
                 [it_list[N_ACC + N_PACK + i] for i in range_constexpr(NUM_BATCHES_KV)],
+                [it_list[_pre + i] for i in range_constexpr(XPHASE_DEPTH)],
             )
 
         if active:
@@ -1164,31 +1247,40 @@ def build_hstu_attention_fwd_pp(
                 unmasked_end = kv_tile_start
 
             # ---- Prologue -----------------------------------------------------
-            # Trip 0's GEMM2 consumes P(-1) = 0 against V(-1), which does not
-            # exist. A zero A operand does NOT make that a no-op: 0 * NaN is NaN
-            # and would poison the accumulators for the whole sweep. LDS is not
-            # zeroed between workgroups, so zero the slot it will read.
-            # Sub-trip u=0 reads v_smem[(0+1) % V_SLOTS] == v_smem[1] == lds.v1.
-            V_ELEMS = hidden_dim * V_T_STRIDE
-            c_zero_elem = fx.Float32(0.0).to(elem_dtype)
-            for _z in range_constexpr(
-                (V_ELEMS + BLOCK_THREADS - 1) // BLOCK_THREADS
-            ):
-                _zi = tid + fx.Int32(_z * BLOCK_THREADS)
-                _zi = (_zi < fx.Int32(V_ELEMS)).select(_zi, fx.Int32(0))
-                lds.v1[_zi] = c_zero_elem
-
-            # Nothing inside the loop writes K(first) -- M(i) writes K(i+1) -- so
-            # the prologue stages it, and primes each group's carried register
-            # set: g0 carries K(first+1), g1 carries V(first).
+            # Both groups load tile `first`: g0 needs K(first) for M(first)'s QK
+            # units, g1 needs V(first)'s d-chunk 0 for the rotated bootstrap.
+            # One load serves both, because the base pointer is selected.
             first = kv_tile_start
             _t_first = fx.Int32(first) * fx.Int32(BLOCK_N)
-            k0_vecs = async_load_kv_regs(_t_first)
+            boot = async_load_kv_regs(_t_first)
             rocdl.s_waitcnt(vmcnt=0)
+            _boot = kv_zero_fold(boot, _t_first)
             if is_g0:
-                store_k_regs_to_lds(kv_zero_fold(k0_vecs, _t_first), k_smem[0])
-            prime_tile = first + is_g0.select(fx.Int32(1), fx.Int32(0))
-            carry_regs = async_load_kv_regs(prime_tile * fx.Int32(BLOCK_N))
+                # Nothing inside the loop writes K(first) -- M(i) writes K(i+1).
+                store_k_regs_to_lds(_boot, k_smem[0])
+            else:
+                # THE V BOOTSTRAP. vslot 1 is what M(first) reads, and under the
+                # rotation it must hold d-chunk 0 of tile `first` plus chunks
+                # 1..D-1 of the nonexistent tile `first-1`. Rotated lanes write
+                # the former; every other lane writes ZERO, which supplies the
+                # latter -- so this one store also does the job the explicit
+                # zeroing loop used to, and the loop is gone.
+                #
+                # That zeroing is not optional: M(first)'s GEMM2 multiplies
+                # P(-1) = 0 against whatever is in those rows, and 0 * NaN is
+                # NaN. LDS is not cleared between workgroups.
+                store_v_regs_to_lds(
+                    [
+                        kv_rot_lane.select(
+                            _boot[b], Vec.filled(VEC_KV, 0.0, elem_dtype).ir_value()
+                        )
+                        for b in range_constexpr(NUM_BATCHES_KV)
+                    ],
+                    v_smem[1],
+                )
+            # M(first) ds_writes the tile `kv_stage_start(first)` names, so prime
+            # the carried staging set with exactly that.
+            carry_regs = async_load_kv_regs(kv_stage_start(fx.Int32(first)))
 
             # The skew: g0 burns one extra barrier so that from here on g0 is in
             # phase M exactly when g1 is in phase V, and vice versa. Barrier
@@ -1209,8 +1301,15 @@ def build_hstu_attention_fwd_pp(
             rocdl.s_waitcnt(lgkmcnt=0)
             phase_barrier()
 
+            # M(first)'s PV operates on tile `first-1`, which does not exist, so
+            # its carried chunk-0 packs are zero -- P(-1) is zero too, and
+            # 0 * 0 is exact. From M(first+1) on they come from the tail.
+            pre_init = [c_zero_pack for _ in range_constexpr(XPHASE_DEPTH)]
             carry_init = (
-                acc_init + [c_zero_pack for _ in range_constexpr(N_PACK)] + carry_regs
+                acc_init
+                + [c_zero_pack for _ in range_constexpr(N_PACK)]
+                + carry_regs
+                + pre_init
             )
 
             # Trip counts. Both MUST be multiples of UNROLL: slot parity is keyed
@@ -1234,7 +1333,7 @@ def build_hstu_attention_fwd_pp(
                 fx.Int32(1),
                 init=carry_init,
             ):  # ty: ignore
-                o_acc, p_prev, kv_regs = split_carry(it)
+                o_acc, p_prev, kv_regs, pre = split_carry(it)
                 base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
                 for u in range_constexpr(UNROLL):
                     # Loop rotated: the closing barrier of each gate phase is
@@ -1246,8 +1345,8 @@ def build_hstu_attention_fwd_pp(
                     if const_expr(u == 0):
                         phase_barrier()
                     kv_tile = base + fx.Int32(u)
-                    o_acc, s_accs, kv_regs = mfma_phase(
-                        o_acc, p_prev, kv_regs, kv_tile, u
+                    o_acc, s_accs, kv_regs, pre = mfma_phase(
+                        o_acc, p_prev, kv_regs, pre, kv_tile, u
                     )
                     phase_barrier()
                     p_flat = gate_phase(
@@ -1256,7 +1355,7 @@ def build_hstu_attention_fwd_pp(
                     p_prev = unflatten(p_flat)
                     if const_expr(u < UNROLL - 1):
                         phase_barrier()
-                loop_results = yield (o_acc + p_flat + kv_regs)
+                loop_results = yield (o_acc + p_flat + kv_regs + pre)
 
             # ---- Masked remainder + drain ----
             for _o1, it in range(
@@ -1265,7 +1364,7 @@ def build_hstu_attention_fwd_pp(
                 fx.Int32(1),
                 init=loop_results,
             ):  # ty: ignore
-                o_acc, p_prev, kv_regs = split_carry(it)
+                o_acc, p_prev, kv_regs, pre = split_carry(it)
                 base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
                 for u in range_constexpr(UNROLL):
                     # Loop rotated: the closing barrier of each gate phase is
@@ -1277,8 +1376,8 @@ def build_hstu_attention_fwd_pp(
                     if const_expr(u == 0):
                         phase_barrier()
                     kv_tile = base + fx.Int32(u)
-                    o_acc, s_accs, kv_regs = mfma_phase(
-                        o_acc, p_prev, kv_regs, kv_tile, u
+                    o_acc, s_accs, kv_regs, pre = mfma_phase(
+                        o_acc, p_prev, kv_regs, pre, kv_tile, u
                     )
                     phase_barrier()
                     p_flat = gate_phase(
@@ -1287,7 +1386,7 @@ def build_hstu_attention_fwd_pp(
                     p_prev = unflatten(p_flat)
                     if const_expr(u < UNROLL - 1):
                         phase_barrier()
-                loop_results = yield (o_acc + p_flat + kv_regs)
+                loop_results = yield (o_acc + p_flat + kv_regs + pre)
 
             # Closes the last sub-trip's gate phase, which the rotation left
             # without a trailing barrier inside the loop.
