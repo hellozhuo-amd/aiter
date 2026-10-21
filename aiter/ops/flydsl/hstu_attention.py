@@ -38,6 +38,10 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd import (
     build_hstu_attention_fwd,
     validate_hstu_attention_fwd,
 )
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd_pp import (
+    build_hstu_attention_fwd_pp,
+    validate_hstu_attention_fwd_pp,
+)
 from aiter.ops.triton.utils.common_utils import prev_power_of_2
 
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
@@ -248,6 +252,60 @@ def _get_default_config(
     return as_dict(128, 32, 4, 2)
 
 
+# The only tile the ping-pong forward is tuned for. 8 waves give 2 per SIMD
+# inside one barrier domain, and block_m quantises to 128 -- but 128 itself fits
+# 4 waves/SIMD, so a second workgroup co-resides and the phase alternation stops
+# owning the SIMD. Of the shapes that do give 1 WG/CU, (384,64) and (640,32)
+# measure within 1% of each other and both beat the shipping kernel; (256,32) is
+# 12% worse, because the kernel is VALU-bound and shorter phases cannot amortise
+# the barriers. See hstu_attention_fwd_pp.py's docstring for the full ladder.
+_FWD_PP_TILES = {
+    "block_m": 384,
+    "block_n": 64,
+    "num_waves": 8,
+    "waves_per_eu": 2,
+}
+
+
+def _fwd_pp_requested() -> bool:
+    """AITER_HSTU_FWD_PINGPONG, read OUTSIDE the lru_cache.
+
+    `_compile_launcher` is cached, so an env var read in there would be frozen
+    at whatever it was the first time each shape was compiled. Resolving it here
+    and passing the result in makes it part of the cache key instead.
+    """
+    return os.environ.get("AITER_HSTU_FWD_PINGPONG", "") in ("1", "true")
+
+
+def _fwd_pp_launcher(
+    *, pingpong: bool | None, pp_env: bool, custom_config: dict, **kwargs
+):
+    """The ping-pong forward, or None to fall back to the shipping kernel.
+
+    Opt-in ONLY: reached via `pingpong=True` or AITER_HSTU_FWD_PINGPONG=1, never
+    as a default. It is gated to gfx942 / bf16 / head_dim == hidden_dim, so a
+    shape it cannot serve has to keep the general kernel. `pingpong=True` is an
+    explicit request and raises if the shape is unsupported; the env var is a
+    blanket switch across every shape in a process, so there it degrades to the
+    shipping kernel instead of breaking unrelated calls.
+    """
+    if pingpong is False:
+        return None
+    explicit = pingpong is True
+    if not explicit and not pp_env:
+        return None
+
+    config = {**_FWD_PP_TILES, **custom_config}
+    pp_kwargs = {**kwargs, **config}
+    try:
+        validate_hstu_attention_fwd_pp(**pp_kwargs)
+    except ValueError:
+        if explicit:
+            raise
+        return None
+    return build_hstu_attention_fwd_pp(**pp_kwargs)
+
+
 @functools.lru_cache(maxsize=16384)
 def _compile_launcher(
     *,
@@ -266,6 +324,8 @@ def _compile_launcher(
     block_n: int | None,
     num_waves: int | None,
     waves_per_eu: int | None,
+    pingpong: bool | None = None,
+    pp_env: bool = False,
 ) -> Callable:
     custom_config: dict = {
         "block_m": block_m,
@@ -274,6 +334,25 @@ def _compile_launcher(
         "waves_per_eu": waves_per_eu,
     }
     custom_config = {k: v for k, v in custom_config.items() if v is not None}
+
+    # Checked before the tuned/default merge: the ping-pong kernel carries its
+    # own tile and the forward CSV's rows are for the shipping geometry.
+    pp = _fwd_pp_launcher(
+        pingpong=pingpong,
+        pp_env=pp_env,
+        custom_config=custom_config,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        causal=causal,
+        max_attn_len=max_attn_len,
+        has_targets=has_targets,
+        alpha=alpha,
+        dtype_str=dtype_str,
+        contextual_seq_len=contextual_seq_len,
+    )
+    if pp is not None:
+        return pp
 
     tuned_config = _get_tuned_config(
         dtype_str=dtype_str,
@@ -405,6 +484,7 @@ def flydsl_hstu_attention_fwd(
     block_n: int | None = None,
     num_waves: int | None = None,
     waves_per_eu: int | None = None,
+    pingpong: bool | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_inputs(
@@ -432,6 +512,8 @@ def flydsl_hstu_attention_fwd(
         block_n=block_n,
         num_waves=num_waves,
         waves_per_eu=waves_per_eu,
+        pingpong=pingpong,
+        pp_env=_fwd_pp_requested(),
     )
 
     out = torch.empty_like(v)
