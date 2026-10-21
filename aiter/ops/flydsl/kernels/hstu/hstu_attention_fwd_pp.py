@@ -15,7 +15,7 @@ SIMD; a half-iteration skew puts one of that pair in M whenever the other is in
 V, and the matrix core and the VALU pipe are then both busy continuously.
 Ported from `hstu_attention_bwd_fused_pp.py`.
 
-Geometry is **(384, 64, 8, 2)**. Measured at B=1024 H=4 N=16384 d=64 against the
+Geometry is **(640, 32, 8, 2)**. Measured at B=1024 H=4 N=16384 d=64 against the
 shipping kernel's tuned (128,32,4,2), bf16, sparsity 0.95:
 
     shipping tuned (128,32,4,2)   146.3 ms
@@ -23,9 +23,10 @@ shipping kernel's tuned (128,32,4,2), bf16, sparsity 0.95:
     pp  rotated, lockstep         164.4 ms  +12.4%   1 WG/CU, no skew
     pp  + skew/setprio            154.2 ms   +5.5%   the ping-pong itself: -6.2%
     pp  + vectorize-slp=False     150.9 ms   +3.0%
-    pp  (384,64) tuned            141.9 ms   -3.0%   1.030x
+    pp  staging zero-fold moved   140.6 ms   -3.9%   see async_load_kv_regs
+    pp  (640,32) tuned            134.2 ms   -8.2%   1.089x
 
-and 1.030 / 1.027 / 1.040 / 1.013x over the four benchmark cells (train H=4/H=8,
+and 1.088 / 1.113 / 1.096 / 1.103x over the four benchmark cells (train H=4/H=8,
 infer H=4/H=8). Unlike the backward's fused kernel -- 1.31x at H=4 but 1.17x at
 H=8 -- the win here is flat across cells.
 
@@ -288,8 +289,8 @@ def build_hstu_attention_fwd_pp(
     alpha: float,
     dtype_str: str,
     *,
-    block_m: int = 384,
-    block_n: int = 64,
+    block_m: int = 640,
+    block_n: int = 32,
     num_waves: int = 8,
     waves_per_eu: int = 2,
 ):
@@ -697,30 +698,72 @@ def build_hstu_attention_fwd_pp(
             ordinary SSA vector, which is the point -- it can be carried across a
             phase barrier and the loop backedge.
 
+            Returns the RAW loaded vectors. The out-of-range zero-fold is NOT
+            applied here -- `kv_zero_fold` does it at the consumer, one phase
+            pair later. That split is the whole reason the staging pipeline has
+            any depth: a `select` on the loaded value is a CONSUMER of the load,
+            so folding here forces the compiler to sink an `s_waitcnt vmcnt(0)`
+            into the phase that issued it, and the latency this kernel carries
+            registers across a barrier to hide gets paid immediately instead.
+            Measured in the ISA before the split:
+
+                global_load_dwordx4 v[122:125], v[122:123], off
+                s_waitcnt vmcnt(0)                     <- drains what was just issued
+                v_cndmask_b32_e32   v125, 0, v125, vcc
+
+            The address guard below is fine to keep here: it feeds the ADDRESS,
+            not the result, so it does not wait on anything.
+
             There is no `full_tile` variant. The shipping kernel drops the
             `tok < seq_len` guard on tiles it knows are fully in-seq, which is
             sound only because it loads and computes the SAME tile. Under the
             ping-pong rotation the load runs one or two tiles ahead of the
             compute, so the flag no longer tracks the loop and the unmasked loop
             would prefetch a masked tile with its bounds guard elided. The guard
-            costs one compare+select per batch (NUM_BATCHES_KV == 1 at the
-            benchmark shape); the elision costs an out-of-range global read.
+            costs one compare+select per batch; the elision costs an
+            out-of-range global read.
             """
             vecs = []
             for b in range_constexpr(NUM_BATCHES_KV):
                 row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
                 tok = kv_start + row
-                guard = tok < seq_len
-                if const_expr(KV_NEEDS_GUARD):
-                    guard = guard & (row < fx.Int32(BLOCK_N))
+                guard = _kv_row_guard(row, tok)
                 safe = guard.select(seq_start + tok, seq_start)
-                raw = kv_load(
-                    fx.Int64(safe), head_idx, kv_col // fx.Int32(VEC_KV)
-                ).ir_value()
                 vecs.append(
-                    guard.select(raw, Vec.filled(VEC_KV, 0.0, elem_dtype).ir_value())
+                    kv_load(
+                        fx.Int64(safe), head_idx, kv_col // fx.Int32(VEC_KV)
+                    ).ir_value()
                 )
             return vecs
+
+        def _kv_row_guard(row, tok):
+            """In-range predicate for one staging row."""
+            guard = tok < seq_len
+            if const_expr(KV_NEEDS_GUARD):
+                guard = guard & (row < fx.Int32(BLOCK_N))
+            return guard
+
+        def kv_zero_fold(vecs, kv_start):
+            """Zero the out-of-range rows of a staged set, at its CONSUMER.
+
+            The predicate is RECOMPUTED here from `kv_start` rather than carried
+            alongside the vectors. Carrying it would mean threading an i1 through
+            the loop's iter_args, and recomputing costs one compare per batch
+            against a scarce register budget (250 of 256 VGPRs at the tuned
+            geometry). The caller is responsible for passing the kv_start the
+            vectors were LOADED with, not the tile it is currently computing --
+            see `mfma_phase`, where those differ by one or two tiles.
+            """
+            folded = []
+            for b in range_constexpr(NUM_BATCHES_KV):
+                row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
+                guard = _kv_row_guard(row, kv_start + row)
+                folded.append(
+                    guard.select(
+                        vecs[b], Vec.filled(VEC_KV, 0.0, elem_dtype).ir_value()
+                    )
+                )
+            return folded
 
         def store_k_regs_to_lds(vecs, ks_mem):
             """g0 only: write K vecs to LDS at XOR-swizzled columns."""
@@ -920,8 +963,11 @@ def build_hstu_attention_fwd_pp(
             o_acc = accum_o_tile(o_acc, p_prev, v_smem[v_prev])
 
             # Publish the set issued one phase pair ago, then issue the next.
-            # g0 is a tile further ahead than g1 because it writes K(i+1) while
-            # g1 writes V(i); one select covers the difference.
+            # Each group writes ONE tensor, never both: g0's M(i) writes only
+            # K(i+1), g1's M(i) writes only V(i). So g0's staged TILE INDEX runs
+            # one ahead of g1's, and one select covers the difference. (Not to
+            # be confused with the phase skew, which runs the other way: g0
+            # burns the extra prologue barrier, so g0 is the group that LAGS.)
             #
             # THIS is where the staging load is waited -- immediately ahead of
             # the ds_write that consumes it, and nowhere else. At this point the
@@ -931,10 +977,19 @@ def build_hstu_attention_fwd_pp(
             # load fired moments earlier and collapse the pipeline to depth 1 --
             # the stall this kernel exists to remove.
             rocdl.s_waitcnt(vmcnt=0)
+            # `kv_regs` was issued in M(i-1) and is RAW -- the zero-fold happens
+            # here, at the consumer, so that the `v_cndmask` is not what forces
+            # the wait above. The tile it belongs to is one ahead of this one for
+            # g0 (which writes K(i+1)) and this very tile for g1 (which writes
+            # V(i)); mirrors the `next_tile` offsets below, shifted by a phase.
+            staged_start = (
+                kv_tile + is_g0.select(fx.Int32(1), fx.Int32(0))
+            ) * fx.Int32(BLOCK_N)
+            kv_vals = kv_zero_fold(kv_regs, staged_start)
             if is_g0:
-                store_k_regs_to_lds(kv_regs, k_smem[k_fill])
+                store_k_regs_to_lds(kv_vals, k_smem[k_fill])
             else:
-                store_v_regs_to_lds(kv_regs, v_smem[v_cur])
+                store_v_regs_to_lds(kv_vals, v_smem[v_cur])
             rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_KV, 0)
 
             next_tile = kv_tile + is_g0.select(fx.Int32(2), fx.Int32(1))
@@ -1033,10 +1088,11 @@ def build_hstu_attention_fwd_pp(
             # the prologue stages it, and primes each group's carried register
             # set: g0 carries K(first+1), g1 carries V(first).
             first = kv_tile_start
-            k0_vecs = async_load_kv_regs(first * fx.Int32(BLOCK_N))
+            _t_first = fx.Int32(first) * fx.Int32(BLOCK_N)
+            k0_vecs = async_load_kv_regs(_t_first)
             rocdl.s_waitcnt(vmcnt=0)
             if is_g0:
-                store_k_regs_to_lds(k0_vecs, k_smem[0])
+                store_k_regs_to_lds(kv_zero_fold(k0_vecs, _t_first), k_smem[0])
             prime_tile = first + is_g0.select(fx.Int32(1), fx.Int32(0))
             carry_regs = async_load_kv_regs(prime_tile * fx.Int32(BLOCK_N))
 

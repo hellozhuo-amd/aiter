@@ -255,13 +255,17 @@ def _get_default_config(
 # The only tile the ping-pong forward is tuned for. 8 waves give 2 per SIMD
 # inside one barrier domain, and block_m quantises to 128 -- but 128 itself fits
 # 4 waves/SIMD, so a second workgroup co-resides and the phase alternation stops
-# owning the SIMD. Of the shapes that do give 1 WG/CU, (384,64) and (640,32)
-# measure within 1% of each other and both beat the shipping kernel; (256,32) is
-# 12% worse, because the kernel is VALU-bound and shorter phases cannot amortise
-# the barriers. See hstu_attention_fwd_pp.py's docstring for the full ladder.
+# owning the SIMD. (256,32) is 12% worse than either shape below, because the
+# kernel is VALU-bound and shorter phases cannot amortise the barriers. See
+# hstu_attention_fwd_pp.py's docstring for the full ladder.
+#
+# (640,32) over (384,64) by ~1.7% on every benchmark cell. That ranking is only
+# true as of the staging fix: while the bounds-guard select was forcing a
+# vmcnt(0) into the phase that issued the load, (384,64) led by 1%. A tile sweep
+# run over a scheduling stall ranks the stall's interaction, not the tiles.
 _FWD_PP_TILES = {
-    "block_m": 384,
-    "block_n": 64,
+    "block_m": 640,
+    "block_n": 32,
     "num_waves": 8,
     "waves_per_eu": 2,
 }
