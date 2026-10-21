@@ -86,6 +86,7 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -731,16 +732,33 @@ def build_hstu_attention_fwd_pp(
             return xid
 
         def pack_p(vals):
-            """Pack 4 f32 scores into a bf16/f16 MFMA pack (the GEMM2 A-operand fragment)."""
-            if const_expr(is_bf16):
-                c16 = fx.Int32(16)
-                cmask = fx.Int32(0xFFFF0000)
+            """Pack 4 f32 scores into a bf16/f16 MFMA pack (the GEMM2 A-operand fragment).
 
-                # bf16 = the high 16 bits of each f32 (round-toward-zero truncation, no round-to-nearest).
+            bf16 truncation IS a byte selection -- the high half of each f32 --
+            so one `v_perm_b32` does a pair. The arithmetic spelling
+            `(hi & 0xFFFF0000) | (lo >> 16)` is bit-for-bit the same but costs
+            two VALU after the backend fuses the and/or (`v_lshrrev_b32` +
+            `v_and_or_b32`, measured 3.15% of all active time in the trace).
+            gfx942 has no `v_cvt_pk_bf16_f32`; that is CDNA4 only.
+            """
+            if const_expr(is_bf16):
+                # Bytes 7,6 of src0 (hi) and 3,2 of src1 (lo): the two high halves.
+                sel = fx.Int32(0x07060302)
+
                 def bf16_pair(lo_f32, hi_f32):
-                    lo_i32 = lo_f32.bitcast(fx.Int32)
-                    hi_i32 = hi_f32.bitcast(fx.Int32)
-                    return (hi_i32 & cmask) | lo_i32.shrui(c16)
+                    return fx.Int32(
+                        llvm.call_intrinsic(
+                            fx.Int32.ir_type,
+                            "llvm.amdgcn.perm",
+                            [
+                                hi_f32.bitcast(fx.Int32).ir_value(),
+                                lo_f32.bitcast(fx.Int32).ir_value(),
+                                sel.ir_value(),
+                            ],
+                            [],
+                            [],
+                        )
+                    )
 
                 pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
                 return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
