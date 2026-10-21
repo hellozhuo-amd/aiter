@@ -264,7 +264,7 @@ def _get_default_config(
 # vmcnt(0) into the phase that issued the load, (384,64) led by 1%. A tile sweep
 # run over a scheduling stall ranks the stall's interaction, not the tiles.
 _FWD_PP_TILES = {
-    "block_m": 640,
+    "block_m": 512,
     "block_n": 32,
     "num_waves": 8,
     "waves_per_eu": 2,

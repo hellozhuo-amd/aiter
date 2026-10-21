@@ -15,7 +15,7 @@ SIMD; a half-iteration skew puts one of that pair in M whenever the other is in
 V, and the matrix core and the VALU pipe are then both busy continuously.
 Ported from `hstu_attention_bwd_fused_pp.py`.
 
-Geometry is **(640, 32, 8, 2)**. Measured at B=1024 H=4 N=16384 d=64 against the
+Geometry is **(512, 32, 8, 2)**. Measured at B=1024 H=4 N=16384 d=64 against the
 shipping kernel's tuned (128,32,4,2), bf16, sparsity 0.95:
 
     shipping tuned (128,32,4,2)   146.3 ms
@@ -24,11 +24,17 @@ shipping kernel's tuned (128,32,4,2), bf16, sparsity 0.95:
     pp  + skew/setprio            154.2 ms   +5.5%   the ping-pong itself: -6.2%
     pp  + vectorize-slp=False     150.9 ms   +3.0%
     pp  staging zero-fold moved   140.6 ms   -3.9%   see async_load_kv_regs
-    pp  (640,32) tuned            134.2 ms   -8.2%   1.089x
+    pp  merged unit stream        132.9 ms   -9.1%   one UNIT_ORDER walk
+    pp  + rolling window          131.3 ms  -10.3%   1.116x
 
-and 1.088 / 1.113 / 1.096 / 1.103x over the four benchmark cells (train H=4/H=8,
+and 1.116 / 1.140 / 1.121 / 1.145x over the four benchmark cells (train H=4/H=8,
 infer H=4/H=8). Unlike the backward's fused kernel -- 1.31x at H=4 but 1.17x at
 H=8 -- the win here is flat across cells.
+
+The tile ladder is worth re-reading after any scheduling change: (640,32) led
+until the unit stream landed, then lost 15% to 52 spilled registers, because
+BLOCK_M=640 means Q_SUBTILES=5 and the burst holds every s_accs live at once.
+A sweep run over a stall ranks the stall's interaction, not the tiles.
 
 **This kernel is VALU-bound, not MFMA-bound -- the opposite of the backward.**
 Counted from the generated ISA, the unmasked loop body is 32 MFMA (512 cy of
@@ -289,7 +295,7 @@ def build_hstu_attention_fwd_pp(
     alpha: float,
     dtype_str: str,
     *,
-    block_m: int = 640,
+    block_m: int = 512,
     block_n: int = 32,
     num_waves: int = 8,
     waves_per_eu: int = 2,
@@ -414,6 +420,61 @@ def build_hstu_attention_fwd_pp(
     # why the unmasked loop's trip count has to be a multiple of UNROLL.
     UNROLL = 2
     assert UNROLL % K_SLOTS == 0 and UNROLL % V_SLOTS == 0
+
+    # ---- The MFMA burst's unit stream -------------------------------------
+    # A UNIT is one `ds_read` plus the Q_SUBTILES MFMAs that consume it:
+    #   QK unit j -> (ng, ks) = (j % KV_SUBTILES, j // KV_SUBTILES)
+    #   PV unit j -> (c,  ng) = (j % D_CHUNKS,    j // D_CHUNKS)
+    # Both encodings are chosen so CONSECUTIVE units of the same burst touch
+    # different accumulators -- QK chains on s_accs[ng], PV on o_acc[c] -- which
+    # is what keeps the dependent links of each chain far apart.
+    N_QK_UNITS = KV_SUBTILES * K_STEPS_K
+    N_PV_UNITS = D_CHUNKS * KV_SUBTILES
+    # head_dim == hidden_dim is gated, so K_STEPS_K == D_CHUNKS and the two
+    # bursts always have the same unit count: the interleave is exactly 1:1.
+    assert N_QK_UNITS == N_PV_UNITS
+    N_UNITS = N_QK_UNITS + N_PV_UNITS
+
+    # The two GEMMs are INTERLEAVED, not concatenated. GEMM1 writes s_accs and
+    # GEMM2 writes o_acc and they share no register, so alternating them hands
+    # the matrix core two independent accumulator chains to fill its 16-cycle
+    # issue window with instead of one dependent chain. The compiler finds this
+    # on its own today; stating it keeps it true once the rolling window below
+    # pins the order. Set to QK-then-PV for the fp8 kernel's sequential form.
+    UNIT_ORDER = [
+        spec
+        for j in range(N_QK_UNITS)
+        for spec in (("qk", j), ("pv", j))
+    ]
+    assert len(UNIT_ORDER) == N_UNITS
+
+    # Rolling operand window, ported from the gfx950 fp8 ping-pong FMHA kernel
+    # (`op_gemm.py`): the MFMAs at step `s` consume the pack read at step
+    # `s - PREFETCH_DEPTH`, so no MFMA ever waits on its own `ds_read`. Each
+    # unit is Q_SUBTILES MFMAs ~= Q_SUBTILES*16 cycles, so depth 2 buys roughly
+    # 2*Q_SUBTILES*16 cycles of cover against a ~130-cycle LDS round trip.
+    # Depth is nearly flat: 130.69 / 130.66 / 130.51 / 130.70 / 131.42 ms at
+    # depth 1 / 2 / 3 / 4 / 6 (512,32). Two is the fp8 kernel's choice and the
+    # cheapest that ties; past four the window's own registers start costing.
+    PREFETCH_DEPTH = 2
+    # NOT chained across the phase barrier, and that is a measured decision.
+    # The fp8 kernel's tail also reads the NEXT phase's first operands, handing
+    # them over in registers. Here that needs a THIRD slot per tensor -- what
+    # the next phase reads is what this phase writes -- plus UNROLL 2 -> 3.
+    # Built and measured: the ISA confirmed it worked (the first MFMA after the
+    # barrier issued with no `s_waitcnt` at all, against `rrr; lgkmcnt(2)`
+    # without it), and it still measured 131.7 ms against 131.3, for +10 VGPR
+    # and +9 KB of LDS. The phase-boundary read latency is simply not on the
+    # critical path: this kernel is VALU-bound, so the MFMA stream has slack to
+    # absorb it. Do not re-derive this from the fp8 source -- it is MFMA-bound,
+    # which is why the chain pays there and not here.
+    # Ring slots, indexed by STEP and never by unit value: UNIT_ORDER is a
+    # permutation, so keying on the unit would let a later unit's read land in a
+    # slot whose occupant has not been consumed yet -- silently wrong results.
+    # Keyed by step the reuse distance is exactly RING against a PREFETCH_DEPTH
+    # lookahead, so any depth below RING is correct.
+    WIN_RING = 4
+    assert 0 <= PREFETCH_DEPTH < WIN_RING <= N_UNITS
 
     @fx.struct
     class SharedStorage:
@@ -793,45 +854,106 @@ def build_hstu_attention_fwd_pp(
                     vs_mem[kv_col + fx.Int32(j), kv_grp, kv_lane] = vv[j]
 
         # ==== GEMM1: Q*K^T -> P (P fragment already in GEMM2 A-operand layout) ====
-        def read_k_packs(ng, ks_mem):
-            """LDS-read K A-operand packs for sub-tile ng (2D-indexed; col via the shared swizzle).
-            The swizzle uses the LOCAL row (0..BLOCK_N-1) so it matches the store's layout.
+        # ---- Per-UNIT operand readers --------------------------------------
+        # A "unit" is one `ds_read` plus the Q_SUBTILES MFMAs that consume it.
+        # Reading one unit at a time (rather than a whole sub-tile's worth) is
+        # what lets the MFMA burst roll a lookahead window over them, so no MFMA
+        # waits on its own read -- see `mfma_phase`.
+        def read_k_unit(ng, ks, ks_mem):
+            """One K A-operand pack: sub-tile `ng`, contraction step `ks`.
+
+            2D-indexed; the column goes through the shared swizzle, on the LOCAL
+            row (0..BLOCK_N-1) so it matches the store's layout.
             """
             local_k_row = fx.Int32(ng * MFMA_M) + lane_mod_16
-            packs = []
-            for ks in range_constexpr(K_STEPS_K):
-                # k_col = ks*MFMA_K + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
-                k_col_grp = fx.Int32(ks * (MFMA_DIM_K // MFMA_DIM_LANE_K)) + lane_div_16
-                packs.append(
-                    ks_mem[local_k_row, k_swz_grp(local_k_row, k_col_grp), None].load()
+            # k_col = ks*MFMA_K + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
+            k_col_grp = fx.Int32(ks * (MFMA_DIM_K // MFMA_DIM_LANE_K)) + lane_div_16
+            return ks_mem[local_k_row, k_swz_grp(local_k_row, k_col_grp), None].load()
+
+        def read_v_unit(c, ng, vs_mem):
+            """One V B-operand pack: d-chunk `c`, kv sub-tile `ng`.
+
+            V[d, kv] transposed, so 4 consecutive kv are contiguous -> one
+            ds_read_b64.
+            """
+            d_col = fx.Int32(c * MFMA_M) + lane_mod_16
+            # kv_lane = ng*MFMA_M + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
+            kv_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
+            return vs_mem[d_col, kv_grp, None].load().ir_value()
+
+        def gemm1_unit(s_accs, ng, ks, k_pack):
+            """The Q_SUBTILES MFMAs of one QK unit, chained on s_accs[ng][*]."""
+            for qg in range_constexpr(Q_SUBTILES):
+                # Operand swap: A=K, B=Q (not A=Q, B=K) so the MFMA result P lands directly in
+                # GEMM2's A-operand layout (M=query, K=kv) -- P stays register-resident.
+                q_op = q_packs[ks][qg] if ks < K_STEPS else c_zero_dim_pack
+                s_accs[ng][qg] = dim_mfma_acc(
+                    Vec(k_pack).ir_value(), q_op, s_accs[ng][qg]
                 )
-            return packs
+            return s_accs
 
-        def gemm1_tile(k_packs_by_ng):
-            """PHASE M. Q*K^T MFMA only -- no mask, no gate.
+        def gemm2_unit(o_acc, p_packs, c, ng, v_pack):
+            """The Q_SUBTILES MFMAs of one PV unit, chained on o_acc[c*Q+*]."""
+            for qg in range_constexpr(Q_SUBTILES):
+                off = c * Q_SUBTILES + qg
+                o_acc[off] = mfma_acc(p_packs[ng][qg], v_pack, o_acc[off])
+            return o_acc
 
-            Returns the raw fp32 score accumulators s_accs[ng][qg], which phase V
-            then masks and gates. Splitting here is what makes the two phases
-            disjoint: every MFMA is on this side, every transcendental on the
-            other. k_packs_by_ng comes from `read_k_packs`.
+        def read_unit(spec, ks_mem, vs_mem):
+            """The one `ds_read` of unit `spec`, from the right slot."""
+            kind, j = spec
+            if const_expr(kind == "qk"):
+                return read_k_unit(j % KV_SUBTILES, j // KV_SUBTILES, ks_mem)
+            return read_v_unit(j % D_CHUNKS, j // D_CHUNKS, vs_mem)
+
+        def apply_unit(spec, operand, o_acc, s_accs, p_packs):
+            """The Q_SUBTILES MFMAs of unit `spec`, consuming `operand`."""
+            kind, j = spec
+            if const_expr(kind == "qk"):
+                s_accs = gemm1_unit(
+                    s_accs, j % KV_SUBTILES, j // KV_SUBTILES, operand
+                )
+            else:
+                o_acc = gemm2_unit(
+                    o_acc, p_packs, j % D_CHUNKS, j // D_CHUNKS, operand
+                )
+            return o_acc, s_accs
+
+        def mfma_burst(o_acc, p_packs, ks_mem, vs_mem):
+            """PHASE M's whole MFMA stream: GEMM1 of this tile merged with GEMM2
+            of the previous one, walked as one `UNIT_ORDER` sequence.
+
+            Returns `(o_acc, s_accs)`. The raw fp32 score accumulators go to
+            phase V to be masked and gated -- splitting there is what makes the
+            two phases disjoint: every MFMA is on this side, every
+            transcendental on the other.
             """
             s_accs = [
-                [None for _ in range_constexpr(Q_SUBTILES)]
+                [
+                    Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+                    for _ in range_constexpr(Q_SUBTILES)
+                ]
                 for _ in range_constexpr(KV_SUBTILES)
             ]
-            for ng in range_constexpr(KV_SUBTILES):
-                k_packs = [
-                    Vec(k_packs_by_ng[ng][ks]) for ks in range_constexpr(K_STEPS_K)
-                ]
-                for qg in range_constexpr(Q_SUBTILES):
-                    cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
-                    # Operand swap: A=K, B=Q (not A=Q, B=K) so the MFMA result P lands directly in
-                    # GEMM2's A-operand layout (M=query, K=kv) -- P stays register-resident.
-                    for ks in range_constexpr(K_STEPS_K):
-                        q_op = q_packs[ks][qg] if ks < K_STEPS else c_zero_dim_pack
-                        cur = dim_mfma_acc(k_packs[ks].ir_value(), q_op, cur)
-                    s_accs[ng][qg] = cur
-            return s_accs
+            # Prime the window before the first MFMA, then keep it PREFETCH_DEPTH
+            # units ahead. `sched_barrier` on both sides of each step is what
+            # holds the pattern: without it the scheduler hoists every read to
+            # the head of the phase and the window stops meaning anything.
+            win = [None for _ in range_constexpr(WIN_RING)]
+            for s in range_constexpr(PREFETCH_DEPTH):
+                win[s % WIN_RING] = read_unit(UNIT_ORDER[s], ks_mem, vs_mem)
+            for step in range_constexpr(N_UNITS):
+                rocdl.sched_barrier(0)
+                o_acc, s_accs = apply_unit(
+                    UNIT_ORDER[step], win[step % WIN_RING], o_acc, s_accs, p_packs
+                )
+                sn = step + PREFETCH_DEPTH
+                if const_expr(sn < N_UNITS):
+                    win[sn % WIN_RING] = read_unit(
+                        UNIT_ORDER[sn], ks_mem, vs_mem
+                    )
+                rocdl.sched_barrier(0)
+            return o_acc, s_accs
 
         def gate_tile(kv_start, s_accs, apply_mask=True):
             """PHASE V. Mask + silu gate -> P packs. No memory operation at all.
@@ -903,32 +1025,6 @@ def build_hstu_attention_fwd_pp(
             return p_packs
 
         # ==== GEMM2: P*V -> O (V as natural-layout operand B; P as operand A) ====
-        def accum_o_tile(o_acc, p_packs, vs_mem):
-            """O[m,d] += P[m,n]*V[n,d]. A = P (GEMM1 frag, M=query K=kv), B = V[kv,d] natural.
-
-            `p_packs` is the PREVIOUS tile's gate output and `vs_mem` the previous
-            tile's V slot -- see the rotation note at K_SLOTS. The tiles still
-            land in the accumulator in ascending order, only one trip later, so
-            this is bitwise identical to the unrotated kernel.
-            """
-
-            def read_v_pack(c, ng):
-                # V[d, kv] transposed: 4 consecutive kv contiguous -> one ds_read_b64 = B pack.
-                d_col = fx.Int32(c * MFMA_M) + lane_mod_16
-                # kv_lane = ng*MFMA_M + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
-                kv_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
-                return vs_mem[d_col, kv_grp, None].load().ir_value()
-
-            for c in range_constexpr(D_CHUNKS):
-                v_packs = [read_v_pack(c, ng) for ng in range_constexpr(KV_SUBTILES)]
-                for qg in range_constexpr(Q_SUBTILES):
-                    acc_off = c * Q_SUBTILES + qg
-                    cur = o_acc[acc_off]
-                    for ng in range_constexpr(KV_SUBTILES):
-                        cur = mfma_acc(p_packs[ng][qg], v_packs[ng], cur)
-                    o_acc[acc_off] = cur
-            return o_acc
-
         # ==== The two phases ====
         N_PACK = KV_SUBTILES * Q_SUBTILES
         c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
@@ -953,14 +1049,12 @@ def build_hstu_attention_fwd_pp(
             # transpose scatter; putting it first would make these reads wait on
             # the scatter and turn an lgkmcnt(3) into an lgkmcnt(0) ahead of the
             # MFMAs.
-            k_packs = [
-                read_k_packs(ng, k_smem[k_cur]) for ng in range_constexpr(KV_SUBTILES)
-            ]
-
-            # One contiguous MFMA burst: GEMM1 of this tile beside GEMM2 of the
-            # previous one. That merge is the whole point of the rotation.
-            s_accs = gemm1_tile(k_packs)
-            o_acc = accum_o_tile(o_acc, p_prev, v_smem[v_prev])
+            # One contiguous MFMA burst: GEMM1 of this tile merged with GEMM2
+            # of the previous one. `p_prev` is the previous tile's gate output
+            # and v_smem[v_prev] its V slot -- the rotation. Tiles still land in
+            # the accumulator in ascending order, only one trip later, so this
+            # stays bitwise identical to the unrotated kernel.
+            o_acc, s_accs = mfma_burst(o_acc, p_prev, k_smem[k_cur], v_smem[v_prev])
 
             # Publish the set issued one phase pair ago, then issue the next.
             # Each group writes ONE tensor, never both: g0's M(i) writes only
