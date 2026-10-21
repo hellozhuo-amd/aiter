@@ -28,7 +28,9 @@ shipping kernel's tuned (128,32,4,2), bf16, sparsity 0.95:
     pp  + rolling window          131.3 ms  -10.3%
     pp  + V_ROT_DT cross-phase    130.1 ms  -11.1%
     pp  + v_perm pack_p           127.2 ms  -13.1%   see pack_p
-    pp  + alpha*-log2e into Q     123.7 ms  -15.0%   1.177x
+    pp  + alpha*-log2e into Q     123.7 ms  -15.0%
+    pp  + LDS drain moved to V    122.9 ms  -15.6%   see gate_phase
+    pp  + V slot XOR swizzle      121.4 ms  -16.8%   1.201x
 
 and, as of the V_ROT_DT round, 1.121 / 1.147 / 1.129 / 1.150x over the four
 benchmark cells (train H=4/H=8, infer H=4/H=8); the two gate changes since were
@@ -692,6 +694,32 @@ def build_hstu_attention_fwd_pp(
         # group index directly and index the grouped view without a runtime divide.
         assert K_SWZ_SHIFT >= MFMA_DIM_LANE_K_LOG2
 
+        # Single source of truth for the V LDS swizzle, mirroring `k_swz_grp`.
+        #
+        # The `V_T_STRIDE = BLOCK_N + 8` pad fixes the READ path -- consecutive
+        # lanes walk consecutive d rows, stride 20 dwords, which spreads. It
+        # does nothing for the WRITE: the lanes that collide there differ in d
+        # by VEC_KV, so their addresses differ by VEC_KV*V_T_STRIDE*2/4 = 160
+        # dwords and 160 % 32 == 0 -- all 64 lanes land on 4 banks, 16 deep.
+        # No pad can fix that: spreading 8 lanes needs V_T_STRIDE odd mod 8,
+        # while the grouped view needs it a multiple of MFMA_LANE_K.
+        #
+        # So scramble the kv GROUP by the d row instead, keyed on d/VEC_KV
+        # because that is exactly what the colliding lanes differ in (d%VEC_KV
+        # is constant across them, which is why the obvious key does nothing).
+        # Measured on the real lane maps: store 16-way -> 4-way, read unchanged
+        # at 4-way. Groups stay in [0, BLOCK_N/MFMA_LANE_K), so the scramble
+        # never reaches the pad columns, and both call sites use this function
+        # so it is invisible outside them.
+        V_SWZ_GRPS = BLOCK_N // MFMA_LANE_K
+        assert V_SWZ_GRPS & (V_SWZ_GRPS - 1) == 0, "V swizzle needs a power-of-2 group count"
+
+        def v_swz_key(d_row):
+            return (d_row // fx.Int32(VEC_KV)) & fx.Int32(V_SWZ_GRPS - 1)
+
+        def v_swz_grp(d_row, kv_grp):
+            return kv_grp ^ v_swz_key(d_row)
+
         def k_swz_grp(tile_row, col_grp):
             return col_grp ^ (
                 (tile_row & fx.Int32(K_SWZ_ROWS - 1))
@@ -991,13 +1019,18 @@ def build_hstu_attention_fwd_pp(
             """g1 only: write V vecs to LDS transposed to V[d, kv] so GEMM2 can read 4
             consecutive kv per ds_read_b64. The lane's VEC_KV d-contiguous elements
             scatter to kv-fixed, d-varying LDS slots."""
+            # The swizzle key is `(kv_col + j) // VEC_KV`, and j < VEC_KV, so it
+            # equals `kv_col // VEC_KV` for every j -- loop-invariant. Hoisting
+            # it (and the XOR) out of the j loop turns 8 div/and/xor chains into
+            # one; left inside, the live ranges cost 24 VGPR and 5 spills.
+            vkey = v_swz_key(kv_col)
             for b in range_constexpr(NUM_BATCHES_KV):
                 kv_row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
-                kv_grp = kv_row // fx.Int32(MFMA_LANE_K)
+                swz_grp = (kv_row // fx.Int32(MFMA_LANE_K)) ^ vkey
                 kv_lane = kv_row % fx.Int32(MFMA_LANE_K)
                 vv = Vec(vecs[b])
                 for j in range_constexpr(VEC_KV):
-                    vs_mem[kv_col + fx.Int32(j), kv_grp, kv_lane] = vv[j]
+                    vs_mem[kv_col + fx.Int32(j), swz_grp, kv_lane] = vv[j]
 
         # ==== GEMM1: Q*K^T -> P (P fragment already in GEMM2 A-operand layout) ====
         # ---- Per-UNIT operand readers --------------------------------------
@@ -1025,7 +1058,7 @@ def build_hstu_attention_fwd_pp(
             d_col = fx.Int32(c * MFMA_M) + lane_mod_16
             # kv_lane = ng*MFMA_M + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
             kv_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
-            return vs_mem[d_col, kv_grp, None].load().ir_value()
+            return vs_mem[d_col, v_swz_grp(d_col, kv_grp), None].load().ir_value()
 
         def gemm1_unit(s_accs, ng, ks, k_pack):
             """The Q_SUBTILES MFMAs of one QK unit, chained on s_accs[ng][*]."""
@@ -1251,21 +1284,41 @@ def build_hstu_attention_fwd_pp(
                 kv_stage_start(kv_tile + fx.Int32(1))
             )
 
-            # `phase_barrier` carries no memory fence, so this wait is placed by
-            # hand. No `vmcnt` belongs here: the load issued just above lands in
-            # REGISTERS, which the partner group never reads, so nothing about it
-            # has to be visible at the barrier. Only the ds_write does.
-            #   lgkmcnt(0) : publishes this phase's staging ds_write AND retires
-            #                its operand ds_reads, which is the WAR edge against
-            #                the next trip's writes into the same slots.
-            rocdl.s_waitcnt(lgkmcnt=0)
+            # NO WAIT HERE. The LDS traffic of this phase is not needed at the
+            # barrier that follows it -- it is needed at the NEXT M phase, two
+            # barriers away, so the drain lives at the end of phase V instead
+            # (see `gate_phase`) where it overlaps the gate.
+            #
+            #   this phase's ds_write  -> read by M(i+1): K(i+1) from kslot
+            #     (u+1)%2 and V from vslot u%2, neither of which M(i) or the
+            #     partner's concurrent phase touches.
+            #   this phase's ds_read   -> WAR against M(i+1)'s writes into the
+            #     slots it read, which is also two barriers out.
+            #
+            # No `vmcnt` belongs here either: the staging load issued just above
+            # lands in REGISTERS, which the partner group never reads, so nothing
+            # about it has to be visible at any barrier.
             rocdl.s_setprio(0)
             return o_acc, s_accs, kv_regs_next, pre_next
 
         def gate_phase(kv_start, s_accs, apply_mask=True):
-            """PHASE V: the mask and the SiLU gate. No memory operation at all."""
+            """PHASE V: the mask and the SiLU gate. No memory operation of its own.
+
+            It does carry the previous M phase's LDS drain, at the very end.
+            Phase M's writes are consumed two barriers out, by M(i+1), so
+            draining them where they were issued made the wave sit on a
+            16-way-bank-conflicted `ds_write_b16` scatter with nothing to
+            overlap it. Here the whole gate -- the two quarter-rate
+            transcendentals included -- covers the retirement instead.
+
+            The same wait is the WAR edge for phase M's operand `ds_read`s
+            against M(i+1)'s writes into those slots; `lgkmcnt` is one in-order
+            counter, so one wait does both.
+            """
             p = gate_tile(kv_start, s_accs, apply_mask=apply_mask)
-            return [p[ng][qg] for ng in range_constexpr(KV_SUBTILES) for qg in range_constexpr(Q_SUBTILES)]  # fmt: skip
+            out = [p[ng][qg] for ng in range_constexpr(KV_SUBTILES) for qg in range_constexpr(Q_SUBTILES)]  # fmt: skip
+            rocdl.s_waitcnt(lgkmcnt=0)
+            return out
 
         def unflatten(flat):
             return [
