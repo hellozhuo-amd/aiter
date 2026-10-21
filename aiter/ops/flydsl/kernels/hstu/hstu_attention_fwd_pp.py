@@ -352,6 +352,23 @@ def build_hstu_attention_fwd_pp(
     # share a SIMD, which is the pair the phase alternation (and `s_setprio`)
     # arbitrates. A tile must be staged entirely by one group, because the other
     # group is in phase V and will not reach the ds_write.
+    #
+    # The split is UNBALANCED and that is deliberate. K costs 2 x ds_write_b64
+    # (12.3 cy each) against V's transposed 8 x ds_write_b16 (8.0 cy), so g1's
+    # phase M carries 64 cy of LDS writes to g0's 24.6 -- visible in the trace
+    # as g0 WAIT 18.3% against g1's 14.8%, a 3.5 pp gap the barrier turns into
+    # idle time.
+    #
+    # Rebalancing was built and measured: each group staging HALF THE ROWS of
+    # BOTH tensors gives 1 x b64 + 4 x b16 = 44.3 cy each, a 31% cut to the
+    # critical path, and it drops 23 VGPR (246 -> 223). It is still 0.8% SLOWER
+    # -- 121.9 against 121.0. Halving the rows halves VEC_KV, so the global load
+    # goes from one dwordx4 to two dwordx2 against two different tile offsets,
+    # and the extra address math plus the doubled load count costs more than the
+    # LDS imbalance was worth. The freed registers do not unlock a larger tile
+    # either: (640,32) still spills 13 and (384,64) 21.
+    #
+    # So the imbalance stands, and its ceiling is small -- half of 3.5 pp.
     GRP_WAVES = NUM_WAVES // 2
     GRP_THREADS = GRP_WAVES * WARP_SIZE
     assert GRP_THREADS == 256
