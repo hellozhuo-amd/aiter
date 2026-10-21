@@ -26,11 +26,23 @@ shipping kernel's tuned (128,32,4,2), bf16, sparsity 0.95:
     pp  staging zero-fold moved   140.6 ms   -3.9%   see async_load_kv_regs
     pp  merged unit stream        132.9 ms   -9.1%   one UNIT_ORDER walk
     pp  + rolling window          131.3 ms  -10.3%
-    pp  + V_ROT_DT cross-phase    130.1 ms  -11.1%   1.123x
+    pp  + V_ROT_DT cross-phase    130.1 ms  -11.1%
+    pp  + v_perm pack_p           127.2 ms  -13.1%   see pack_p
+    pp  + alpha*-log2e into Q     123.7 ms  -15.0%   1.177x
 
-and 1.121 / 1.147 / 1.129 / 1.150x over the four benchmark cells (train H=4/H=8,
-infer H=4/H=8). Unlike the backward's fused kernel -- 1.31x at H=4 but 1.17x at
-H=8 -- the win here is flat across cells.
+and, as of the V_ROT_DT round, 1.121 / 1.147 / 1.129 / 1.150x over the four
+benchmark cells (train H=4/H=8, infer H=4/H=8); the two gate changes since were
+measured at the train H=4 cell only. Unlike the backward's fused kernel -- 1.31x
+at H=4 but 1.17x at H=8 -- the win here is flat across cells.
+
+**The gate is the remaining cost, and it is mostly two instructions.** From the
+ATT trace of the (512,32) kernel: `v_rcp_f32` 25.2% and `v_exp_f32` 25.2% of all
+active time, both at 16 cy/execution (quarter rate), against `v_mfma` at 12.6%.
+One exp2 and one rcp per gated element is the floor for silu, and masked lanes
+cannot skip them under SIMD, so the only lever left there is approximating exp2
+-- the fp8 kernel's Schraudolph path, worth ~12.6% of active but with a real
+accuracy cost that HSTU, having no softmax denominator to normalise it away,
+would absorb directly.
 
 The tile ladder is worth re-reading after any scheduling change: (640,32) led
 until the unit stream landed, then lost 15% to 52 spilled registers, because
@@ -71,14 +83,26 @@ Constraints (hard-gated by `validate_hstu_attention_fwd_pp`):
   - num_waves == 8; block_m a multiple of 128 and >= 256
   - fast/unsafe FP math
 
-Everything this kernel produces is **bitwise identical** to
-`hstu_attention_fwd.py` at every geometry, which is what the port was checked
-against at each step (`tmp/hstu_repro/check_fwd_pp.py`). The rotation only
-delays GEMM2 by one trip, leaving the order in which KV tiles enter the
-accumulator unchanged; the skew only reorders publication; and a larger block_m
-only makes the upper sub-block sweep KV tiles the smaller one skipped, which are
-fully masked -> `s=0 -> g=0 -> exp2(0)=1 -> rcp(2)=0.5 -> p=0` exactly, and
-`acc + 0*V` is exact in fp32.
+**Accuracy.** Every SCHEDULING change here is bitwise identical to
+`hstu_attention_fwd.py`, and that is what each step of the port was checked
+against (`tmp/hstu_repro/check_fwd_pp.py`): the rotation only delays GEMM2 by
+one trip, leaving the order in which KV tiles enter the accumulator unchanged;
+the skew only reorders publication; and a larger block_m only makes the upper
+sub-block sweep KV tiles the smaller one skipped, which are fully masked ->
+`s=0 -> g=0 -> exp2(0)=1 -> rcp(2)=0.5 -> p=0` exactly, with `acc + 0*V` exact
+in fp32.
+
+`scale_q_pack` is the one exception and is NOT bitwise: folding
+`alpha * -log2e` into the Q operand rounds the product to bf16's 8 mantissa
+bits, where the per-element form applied it in f32 after the MFMA had
+accumulated. Measured, it costs nothing at the output's own precision --
+against the fp32 oracle the max error is 1.221e-04 (0.71% of peak), the SAME
+figure the shipping kernel reports, across all five mask configurations; and
+against the shipping kernel directly the difference tops out at 1.192e-07,
+which is 2 ULP of the bf16 output. So `check_fwd_pp.py` now reports a
+magnitude rather than a pass/fail, and the binding accuracy test is
+`AITER_HSTU_FWD_PINGPONG=1 python tmp/hstu_repro/check_fwd.py` against the
+oracle.
 """
 
 import functools
@@ -714,8 +738,14 @@ def build_hstu_attention_fwd_pp(
             """silu(alpha*s) via the -log2e base change, stage-batched for ILP. Returns
             p = g*sigm with g = (alpha*-log2e)*s, so p = (-log2e)*silu(alpha*s); the -1/log2e is
             recovered in the O epilogue. A masked/zeroed score gives g=0 -> exp2(0)=1 -> sig=0.5
-            -> p=0."""
-            g = [s * c_alpha_neg_log2e for s in s_list]
+            -> p=0.
+
+            `g` IS the incoming score: the (alpha*-log2e) scale is folded into
+            the Q operand once per workgroup (see `scale_q_pack`) rather than
+            applied to every gated element of every KV tile. The ATT trace had
+            `v_mul_f32` at 516,224 executions against 258,048 gated elements --
+            exactly two per element -- and this removes one of them."""
+            g = s_list
             emu = [exp2_f32(gi) for gi in g]
             den = [c_one_f + e for e in emu]
             sig = [_rcp(d) for d in den]
@@ -764,6 +794,39 @@ def build_hstu_attention_fwd_pp(
                 return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
             elems = [v.to(elem_dtype) for v in vals]
             return Vec.from_elements(elems, elem_dtype).ir_value()
+
+        def scale_q_pack(pack):
+            """Fold (alpha * -log2e) into one Q operand pack.
+
+            Widening is the exact inverse of `pack_p`'s byte selection: element
+            2w sits in the LOW half of word w and element 2w+1 in the high half,
+            so `word << 16` and `word & 0xFFFF0000` recover them as f32 with no
+            conversion instruction at all.
+
+            Paid K_STEPS * Q_SUBTILES times per WORKGROUP, against the
+            per-element-per-KV-tile multiply it replaces.
+
+            NOT bitwise-equal to scaling the score: the product is rounded back
+            to bf16's 8 mantissa bits here, where before it was applied in f32
+            after the MFMA had accumulated. The error is ~2^-9 relative per
+            term and partly cancels across the contraction; see the module
+            docstring for the measured accuracy.
+            """
+            c16 = fx.Int32(16)
+            chi = fx.Int32(0xFFFF0000)
+            words = Vec(pack).bitcast(fx.Int32)
+            vals = []
+            for w in range_constexpr(MFMA_DIM_LANE_K // 2):
+                word = words[w]
+                vals.append((word << c16).bitcast(fx.Float32) * c_alpha_neg_log2e)
+                vals.append((word & chi).bitcast(fx.Float32) * c_alpha_neg_log2e)
+            return pack_p(vals)
+
+        assert is_bf16, "scale_q_pack assumes the bf16 byte layout"
+        q_packs = [
+            [scale_q_pack(q_packs[ks][qg]) for qg in range_constexpr(Q_SUBTILES)]
+            for ks in range_constexpr(K_STEPS)
+        ]
 
         q_rows_i32 = q_rows
         q_row_ids = [to_id(q_rows_i32[qg]) for qg in range_constexpr(Q_SUBTILES)]
