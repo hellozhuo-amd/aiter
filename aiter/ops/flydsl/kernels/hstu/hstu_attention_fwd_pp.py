@@ -29,8 +29,7 @@ shipping kernel's tuned (128,32,4,2), bf16, sparsity 0.95:
     pp  + V_ROT_DT cross-phase    130.1 ms  -11.1%
     pp  + v_perm pack_p           127.2 ms  -13.1%   see pack_p
     pp  + alpha*-log2e into Q     123.7 ms  -15.0%
-    pp  + LDS drain moved to V    122.9 ms  -15.6%   see gate_phase
-    pp  + V slot XOR swizzle      121.4 ms  -16.8%   1.201x
+    pp  + V slot XOR swizzle      122.4 ms  -16.3%   1.195x
 
 and, as of the V_ROT_DT round, 1.121 / 1.147 / 1.129 / 1.150x over the four
 benchmark cells (train H=4/H=8, infer H=4/H=8); the two gate changes since were
@@ -1284,41 +1283,41 @@ def build_hstu_attention_fwd_pp(
                 kv_stage_start(kv_tile + fx.Int32(1))
             )
 
-            # NO WAIT HERE. The LDS traffic of this phase is not needed at the
-            # barrier that follows it -- it is needed at the NEXT M phase, two
-            # barriers away, so the drain lives at the end of phase V instead
-            # (see `gate_phase`) where it overlaps the gate.
+            # `phase_barrier` carries no memory fence, so this wait is by hand,
+            # and it must be HERE -- inside the writing phase, not deferred to
+            # the end of phase V. The skew leaves ZERO barriers of slack on two
+            # edges, because the partner is one phase ahead:
             #
-            #   this phase's ds_write  -> read by M(i+1): K(i+1) from kslot
-            #     (u+1)%2 and V from vslot u%2, neither of which M(i) or the
-            #     partner's concurrent phase touches.
-            #   this phase's ds_read   -> WAR against M(i+1)'s writes into the
-            #     slots it read, which is also two barriers out.
+            #   g0 writes K(i+1) in [B(2i+1), B(2i+2)) and g1 READS it in
+            #     [B(2i+2), ...) -- the very next interval.
+            #   g1 writes V      in [B(2i),   B(2i+1)) and g0's M(i) TAIL
+            #     prefetches it in [B(2i+1), ...) -- likewise.
             #
-            # No `vmcnt` belongs here either: the staging load issued just above
-            # lands in REGISTERS, which the partner group never reads, so nothing
-            # about it has to be visible at any barrier.
+            # `s_barrier` does not retire LDS; `lgkmcnt(0)` before it is what
+            # makes the write visible to the partner. Deferring it measured
+            # 0.6% faster and passed 18 bitwise runs, which is exactly how this
+            # class of bug presents -- the backward's skew race was 0/63 at one
+            # geometry and 36/63 at another.
+            #
+            # The same wait is the WAR edge for this phase's operand ds_reads
+            # against M(i+1)'s writes into those slots; lgkmcnt is one in-order
+            # counter, so one wait does both.
+            #
+            # No `vmcnt` belongs here: the staging load issued just above lands
+            # in REGISTERS, which the partner never reads.
+            rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.s_setprio(0)
             return o_acc, s_accs, kv_regs_next, pre_next
 
         def gate_phase(kv_start, s_accs, apply_mask=True):
             """PHASE V: the mask and the SiLU gate. No memory operation of its own.
 
-            It does carry the previous M phase's LDS drain, at the very end.
-            Phase M's writes are consumed two barriers out, by M(i+1), so
-            draining them where they were issued made the wave sit on a
-            16-way-bank-conflicted `ds_write_b16` scatter with nothing to
-            overlap it. Here the whole gate -- the two quarter-rate
-            transcendentals included -- covers the retirement instead.
-
-            The same wait is the WAR edge for phase M's operand `ds_read`s
-            against M(i+1)'s writes into those slots; `lgkmcnt` is one in-order
-            counter, so one wait does both.
+            The LDS drain does NOT live here, though it looks like it should:
+            phase M's writes have zero barriers of slack against the partner's
+            reads, so the wait has to stay inside phase M. See the note there.
             """
             p = gate_tile(kv_start, s_accs, apply_mask=apply_mask)
-            out = [p[ng][qg] for ng in range_constexpr(KV_SUBTILES) for qg in range_constexpr(Q_SUBTILES)]  # fmt: skip
-            rocdl.s_waitcnt(lgkmcnt=0)
-            return out
+            return [p[ng][qg] for ng in range_constexpr(KV_SUBTILES) for qg in range_constexpr(Q_SUBTILES)]  # fmt: skip
 
         def unflatten(flat):
             return [
