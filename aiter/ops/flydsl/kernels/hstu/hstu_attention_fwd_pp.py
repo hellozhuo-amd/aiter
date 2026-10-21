@@ -1235,7 +1235,24 @@ def build_hstu_attention_fwd_pp(
             v_cur = u % V_SLOTS
             v_prev = (u + 1) % V_SLOTS
 
-            # Every operand ds_read is issued BEFORE the staging ds_writes below.
+            # ORDER IS LOAD-BEARING: every operand ds_read is issued BEFORE the
+            # staging ds_writes below, and the drain for those writes is
+            # therefore lgkmcnt(0) at the bottom of this phase.
+            #
+            # The tempting alternative -- hoist the store to the TOP so a
+            # COUNTED lgkmcnt(PREFETCH_DEPTH) can drain it at the bottom while
+            # the tail's prefetch reads stay in flight, letting the scatter
+            # overlap the burst -- was built and measured at 137.4 ms against
+            # 121.0, a 13.6% REGRESSION. `lgkmcnt` retires in order, so a
+            # store-first order puts all 16 operand reads behind a per-element
+            # b16 scatter, and the 8 MFMAs that the cross-phase prefetch can
+            # cover are not enough to hide it. The scatter's bank-conflicted
+            # LATENCY, not its issue cost, is what the reads end up waiting on.
+            #
+            # So the counted-wait idea is sound in the abstract and dead in
+            # practice here: the only thing it can drain early is a store that
+            # was issued early, and issuing the store early costs more than the
+            # drain saves.
             # lgkmcnt retires in order, and the V store is a per-element b16
             # transpose scatter; putting it first would make these reads wait on
             # the scatter and turn an lgkmcnt(3) into an lgkmcnt(0) ahead of the
