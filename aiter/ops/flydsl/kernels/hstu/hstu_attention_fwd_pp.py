@@ -928,6 +928,37 @@ def build_hstu_attention_fwd_pp(
         q_rows_i32 = q_rows
         q_row_ids = [to_id(q_rows_i32[qg]) for qg in range_constexpr(Q_SUBTILES)]
 
+        # ---- The causal mask as one per-row BORDER --------------------------
+        # `to_id(col) < to_id(q)` is a per (query, column) test, but to_id is
+        # monotone, so for each query row there is a single RAW column
+        # threshold below which it holds. Precompute that threshold once per
+        # q-subtile and the per-element mask becomes `col < border` -- no
+        # per-column to_id, no second compare. This is `generate_mask_border`
+        # from the gfx950 asm FMHA kernel (tmp/asm/gfx950, which folds the
+        # sequence bound in the same way; we fold it into the COLUMN instead,
+        # via COL_OOB, because our bound is per-column and theirs is uniform).
+        #
+        #   border = min(q_raw + 1, id_ceiling)
+        #
+        # The `+1` absorbs the diagonal for every row whose id is NOT clamped:
+        # `col < q+1` is `col <= q`. id_ceiling is the first raw column that
+        # reaches to_id's ceiling, so a row at the ceiling (a TARGET row) stops
+        # there and needs the diagonal term back -- which is why the equality
+        # compare survives only under has_targets.
+        #
+        # A contextual-prefix row has id 0 and attends the whole prefix
+        # instead, which is the same border with the causal term removed.
+        _CTX_S = contextual_seq_len - 1 if has_contextual else 0
+        _id_ceiling = max_id + fx.Int32(_CTX_S) if has_targets else COL_OOB
+        q_border = []
+        for qg in range_constexpr(Q_SUBTILES):
+            _b = q_rows_i32[qg] + fx.Int32(1)
+            if const_expr(has_targets):
+                _b = (_b < _id_ceiling).select(_b, _id_ceiling)
+            if const_expr(has_contextual):
+                _b = (q_row_ids[qg] > fx.Int32(0)).select(_b, _id_ceiling)
+            q_border.append(_b)
+
         # ---- KV range: causal upper bound + active predicate ----
         q_start = q_tile_idx * fx.Int32(BLOCK_M)
         q_end = q_start + fx.Int32(BLOCK_M)
@@ -1242,14 +1273,23 @@ def build_hstu_attention_fwd_pp(
                         col_raw[i] < seq_len
                         for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
-                    col_raw = [
-                        col_in_seq[i].select(col_raw[i], fx.Int32(-1))
-                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                    ]
-                    col_id = [
-                        col_in_seq[i].select(to_id(col_raw[i]), COL_OOB)
-                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                    ]
+                    if const_expr(causal and not has_window):
+                        # The border test is in RAW column positions, so the
+                        # out-of-seq fold is one select and `to_id` never runs
+                        # per column at all.
+                        col_raw = [
+                            col_in_seq[i].select(col_raw[i], COL_OOB)
+                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                        ]
+                    else:
+                        col_raw = [
+                            col_in_seq[i].select(col_raw[i], fx.Int32(-1))
+                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                        ]
+                        col_id = [
+                            col_in_seq[i].select(to_id(col_raw[i]), COL_OOB)
+                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                        ]
                 for qg in range_constexpr(Q_SUBTILES):
                     cur = s_accs[ng][qg]
                     s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
@@ -1261,19 +1301,15 @@ def build_hstu_attention_fwd_pp(
                         def keep_col(i):
                             """causal * window * contextual * target mask for (qg, col i)."""
                             if const_expr(causal and not has_window):
-                                # `(q_id - col_id) > 0` is NOT folded to
-                                # `col_id < q_id` by the backend -- signed
-                                # subtraction can wrap -- so it costs a
-                                # `v_sub_u32` per element that nothing else
-                                # reads. Only the windowed path needs `dist`
-                                # itself.
-                                keep = (q_rows_i32[qg] == col_raw[i]) | (  # noqa: B023
-                                    col_id[i] < q_row_ids[qg]  # noqa: B023
-                                )
-                                if const_expr(has_contextual):
+                                keep = col_raw[i] < q_border[qg]  # noqa: B023
+                                if const_expr(has_targets):
+                                    # A target row's id is clamped, so its
+                                    # border stops at the ceiling and the
+                                    # diagonal has to come back by hand. Rows
+                                    # below the ceiling already have it folded
+                                    # into the `+1`, where this is redundant.
                                     keep = keep | (
-                                        (q_row_ids[qg] == fx.Int32(0))  # noqa: B023
-                                        & (col_id[i] < max_id)  # noqa: B023
+                                        col_raw[i] == q_rows_i32[qg]  # noqa: B023
                                     )
                                 return keep
                             dist = q_row_ids[qg] - col_id[i]  # noqa: B023
