@@ -670,8 +670,6 @@ def build_hstu_attention_fwd_pp(
         # Both address chains are computed, but they are pure index arithmetic;
         # only one load is issued. This relies on k and v having identical
         # layouts, which the validator enforces via head_dim == hidden_dim.
-        kv_in_row = fx.make_layout((hidden_dim // VEC_KV, VEC_KV), (VEC_KV, 1))
-
         # k and v have IDENTICAL layouts -- the validator gates
         # head_dim == hidden_dim -- so their address chains differ only in the
         # base pointer. Evaluating both and selecting the RESULT cost two full
@@ -689,10 +687,34 @@ def build_hstu_attention_fwd_pp(
             it = fx.get_iter(k[row_i64, head_idx, None])
             return fx.Int64(fx.ptrtoint(it)) + kv_base_delta
 
-        def kv_load_at(addr_i64, colgrp):
-            """Load VEC_KV elements at a precomputed row address."""
-            base = fx.inttoptr(_kv_b0.type, addr_i64)
-            return fx.make_view(base, kv_in_row)[colgrp, None].load()
+        # ---- The staging descriptor: bounds-checking in HARDWARE -------------
+        # Every staged row needs "is this token inside the sequence", and out of
+        # range it needs ZERO. Done in software that is a compare, a 64-bit
+        # address select (which needs two `v_mov`s, because `v_cndmask` already
+        # reads VCC and so cannot also take an SGPR source) and a cndmask per
+        # loaded dword -- 9 of phase M's 15 VALU rows.
+        #
+        # A buffer descriptor does all of it for free: base the resource at
+        # (seq_start, head_idx) and set `num_records` to this sequence's extent,
+        # and an access past it is suppressed and returns 0 -- exactly the
+        # zero-fold's semantics, in the memory pipe instead of the VALU. What is
+        # carried per trip then shrinks from a 64-bit address to a 32-bit
+        # voffset.
+        #
+        # This is NOT the `buffer_load ... lds` DMA form, which was ruled out
+        # here (K is stored swizzled and V transposed, so the destination layout
+        # is not the source's). The load still lands in VGPRs and the relayout
+        # stays free; only the descriptor is borrowed.
+        assert (num_heads * head_dim) % VEC_KV == 0
+        KV_ROW_GRPS = (num_heads * head_dim) // VEC_KV  # voffset groups per token
+        kv_desc = fx.rocdl.make_buffer_ptr(
+            fx.inttoptr(_kv_b0.type, kv_row_addr(fx.Int64(seq_start))),
+            num_records_bytes=fx.Int64(seq_len) * fx.Int64(KV_ROW_GRPS * VEC_KV * 2),
+        )
+        kv_buf = fx.make_view(
+            kv_desc,
+            fx.make_layout((seq_len * fx.Int32(KV_ROW_GRPS), VEC_KV), (VEC_KV, 1)),
+        )
 
         # LDS as shape-carried views, grouped by the MFMA_LANE_K pack width so an access is
         # view[row, col_grp, None].load()/.store() (the trailing group axis carries the unit stride;
@@ -966,69 +988,54 @@ def build_hstu_attention_fwd_pp(
         # every time. Same for the guard's token, which advances by BLOCK_N.
         # This is the fp8 kernel's `advance_hbm_offs`; the per-tile form was
         # 24 of phase M's 28 VALU rows.
-        stride_token_elems = num_heads * head_dim
-        STAGE_ADV = fx.Int64(BLOCK_N * stride_token_elems * 2)
-        # Row `seq_start` -- where every out-of-range lane is folded. Loop
-        # invariant, so the in-range address stays a pure carry.
-        kv_oob_addr = kv_row_addr(fx.Int64(seq_start))
+        # Carried in VEC_KV-element GROUPS, which is what the descriptor view is
+        # indexed in. `token*stride + col` is group-aligned for every lane
+        # (`col` is a multiple of VEC_KV and `stride` is a multiple of it too),
+        # so the division is exact and static.
+        STAGE_ADV = fx.Int32(BLOCK_N * KV_ROW_GRPS)
+        # Past `num_records` by construction: a group index of 2**27 is byte
+        # offset 2**31, and the descriptor can never be that large (the tensor
+        # itself would not fit a 32-bit voffset). Only reachable when
+        # KV_NEEDS_GUARD, and loop-invariant when it is -- the predicate is on
+        # the lane's row within the batch, not on the tile.
+        KV_OOB_VOFS = fx.Int32(1 << 27)
 
         def stage_seed(kv_tile):
-            """([addr], [tok]) for the tile this lane stages at `kv_tile`."""
-            a, t = [], []
+            """[voffset] for the tile this lane stages at `kv_tile`."""
+            out = []
             for b in range_constexpr(NUM_BATCHES_KV):
                 row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
                 tok = (kv_tile + kv_stage_bump) * fx.Int32(BLOCK_N) + row
-                a.append(kv_row_addr(fx.Int64(seq_start + tok)))
-                t.append(tok)
-            return a, t
-
-        def stage_advance(addrs, toks):
-            return (
-                [x + STAGE_ADV for x in addrs],
-                [x + fx.Int32(BLOCK_N) for x in toks],
-            )
-
-        def async_load_kv_regs(addr, tok):
-            """Issue this group's coalesced global load to registers (non-blocking).
-
-            Returns the RAW loaded vectors. The out-of-range zero-fold is NOT
-            applied here -- `kv_zero_fold` does it at the consumer, one phase
-            pair later. That split is the whole reason the staging pipeline has
-            any depth: a `select` on the loaded value is a CONSUMER of the load,
-            so folding here forces the compiler to sink an `s_waitcnt vmcnt(0)`
-            into the phase that issued it, and the latency this kernel carries
-            registers across a barrier to hide gets paid immediately instead.
-
-            The address guard IS applied here: it feeds the ADDRESS, not the
-            result, so it waits on nothing. Out-of-range lanes are folded to the
-            loop-invariant `kv_oob_addr` (row `seq_start`) rather than clamped
-            arithmetically, which keeps the in-range address a pure carry.
-            """
-            colgrp = kv_col // fx.Int32(VEC_KV)
-            out = []
-            for b in range_constexpr(NUM_BATCHES_KV):
-                safe = _kv_row_guard(tok[b]).select(addr[b], kv_oob_addr)
-                out.append(kv_load_at(safe, colgrp).ir_value())
+                vofs = tok * fx.Int32(KV_ROW_GRPS) + kv_col // fx.Int32(VEC_KV)
+                if const_expr(KV_NEEDS_GUARD):
+                    # The one guard the descriptor cannot express: these lanes
+                    # are in range of the SEQUENCE but outside the TILE, so the
+                    # row they would read is real data belonging to the next
+                    # tile. Push them past num_records by hand, once.
+                    vofs = (kv_row_in_batch < fx.Int32(BLOCK_N)).select(
+                        vofs, KV_OOB_VOFS
+                    )
+                out.append(vofs)
             return out
 
-        def _kv_row_guard(tok):
-            """In-range predicate for a staging row, from its carried token."""
-            guard = tok < seq_len
-            if const_expr(KV_NEEDS_GUARD):
-                guard = guard & (kv_row_in_batch < fx.Int32(BLOCK_N))
-            return guard
+        def stage_advance(voffs):
+            return [x + STAGE_ADV for x in voffs]
 
-        def kv_zero_fold(vecs, toks):
-            """Zero the out-of-range rows of a staged set, at its CONSUMER.
+        def async_load_kv_regs(voffs):
+            """Issue this group's coalesced global load to registers (non-blocking).
 
-            Takes the CARRIED tokens the load was issued with, so the predicate
-            is the same one the address used and nothing has to be recomputed
-            from a tile index.
+            The out-of-range rows need no fold at all: the descriptor's
+            `num_records` stops at the end of this sequence, so a token past
+            `seq_len` reads back zero in hardware. That used to be a compare, a
+            64-bit address select and a `v_cndmask` per dword, and it had to be
+            split across two phases -- a `select` on a loaded value is a
+            CONSUMER of that load, so applying it here would sink an
+            `s_waitcnt vmcnt(0)` into the issuing phase and collapse the depth-2
+            staging pipeline to depth 1. With the check in the memory pipe there
+            is nothing to split.
             """
             return [
-                _kv_row_guard(toks[b]).select(
-                    vecs[b], Vec.filled(VEC_KV, 0.0, elem_dtype).ir_value()
-                )
+                kv_buf[voffs[b], None].load().ir_value()
                 for b in range_constexpr(NUM_BATCHES_KV)
             ]
 
@@ -1253,7 +1260,7 @@ def build_hstu_attention_fwd_pp(
         N_PACK = KV_SUBTILES * Q_SUBTILES
         c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
-        def mfma_phase(o_acc, p_prev, kv_regs, st_a, st_t, pre, kv_tile, u):
+        def mfma_phase(o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u):
             """PHASE M: both GEMMs, their LDS operand feed, and this group's staging.
 
             Returns (o_acc, s_accs, kv_regs_next). `u` is the sub-trip position,
@@ -1319,7 +1326,7 @@ def build_hstu_attention_fwd_pp(
             # the wait above. The tile it belongs to is one ahead of this one for
             # g0 (which writes K(i+1)) and this very tile for g1 (which writes
             # V(i)); mirrors the `next_tile` offsets below, shifted by a phase.
-            kv_vals = kv_zero_fold(kv_regs, st_t)
+            kv_vals = kv_regs
             if is_g0:
                 store_k_regs_to_lds(kv_vals, k_smem[k_fill])
             else:
@@ -1328,8 +1335,8 @@ def build_hstu_attention_fwd_pp(
 
             # Issued now, ds_written in M(i+1), so it targets M(i+1)'s staged
             # tile: one further out than this phase's, per lane.
-            st_a, st_t = stage_advance(st_a, st_t)
-            kv_regs_next = async_load_kv_regs(st_a, st_t)
+            st_o = stage_advance(st_o)
+            kv_regs_next = async_load_kv_regs(st_o)
 
             # `phase_barrier` carries no memory fence, so this wait is by hand,
             # and it must be HERE -- inside the writing phase, not deferred to
@@ -1355,7 +1362,7 @@ def build_hstu_attention_fwd_pp(
             # in REGISTERS, which the partner never reads.
             rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.s_setprio(0)
-            return o_acc, s_accs, kv_regs_next, st_a, st_t, pre_next
+            return o_acc, s_accs, kv_regs_next, st_o, pre_next
 
         def gate_phase(kv_start, s_accs, apply_mask=True):
             """PHASE V: the mask and the SiLU gate. No memory operation of its own.
@@ -1388,16 +1395,14 @@ def build_hstu_attention_fwd_pp(
             scf.for boundary.
             """
             it_list = list(it) if isinstance(it, (list, tuple)) else [it]
-            o = N_ACC + N_PACK
-            a = o + NUM_BATCHES_KV          # staged vectors
-            t = a + NUM_BATCHES_KV          # staged addresses (i64)
-            pre = t + NUM_BATCHES_KV        # staged tokens (i32)
+            o = N_ACC + N_PACK              # staged vectors
+            a = o + NUM_BATCHES_KV          # staged voffsets (i32)
+            pre = a + NUM_BATCHES_KV        # cross-phase operand prefetch
             return (
                 [it_list[i] for i in range_constexpr(N_ACC)],
                 unflatten([it_list[N_ACC + i] for i in range_constexpr(N_PACK)]),
                 [it_list[o + i] for i in range_constexpr(NUM_BATCHES_KV)],
                 [it_list[a + i] for i in range_constexpr(NUM_BATCHES_KV)],
-                [it_list[t + i] for i in range_constexpr(NUM_BATCHES_KV)],
                 [it_list[pre + i] for i in range_constexpr(XPHASE_DEPTH)],
             )
 
@@ -1438,10 +1443,8 @@ def build_hstu_attention_fwd_pp(
             # One load serves both, because the base pointer is selected.
             first = kv_tile_start
             _t_first = fx.Int32(first) * fx.Int32(BLOCK_N)
-            _b_a, _b_t = stage_seed(fx.Int32(first) - kv_stage_bump)
-            boot = async_load_kv_regs(_b_a, _b_t)
+            _boot = async_load_kv_regs(stage_seed(fx.Int32(first) - kv_stage_bump))
             rocdl.s_waitcnt(vmcnt=0)
-            _boot = kv_zero_fold(boot, _b_t)
             if is_g0:
                 # Nothing inside the loop writes K(first) -- M(i) writes K(i+1).
                 store_k_regs_to_lds(_boot, k_smem[0])
@@ -1467,8 +1470,8 @@ def build_hstu_attention_fwd_pp(
                 )
             # M(first) ds_writes the tile `kv_stage_start(first)` names, so prime
             # the carried staging set with exactly that.
-            carry_a, carry_t = stage_seed(fx.Int32(first))
-            carry_regs = async_load_kv_regs(carry_a, carry_t)
+            carry_o = stage_seed(fx.Int32(first))
+            carry_regs = async_load_kv_regs(carry_o)
 
             # The skew: g0 burns one extra barrier so that from here on g0 is in
             # phase M exactly when g1 is in phase V, and vice versa. Barrier
@@ -1497,8 +1500,7 @@ def build_hstu_attention_fwd_pp(
                 acc_init
                 + [c_zero_pack for _ in range_constexpr(N_PACK)]
                 + carry_regs
-                + carry_a
-                + carry_t
+                + carry_o
                 + pre_init
             )
 
@@ -1523,7 +1525,7 @@ def build_hstu_attention_fwd_pp(
                 fx.Int32(1),
                 init=carry_init,
             ):  # ty: ignore
-                o_acc, p_prev, kv_regs, st_a, st_t, pre = split_carry(it)
+                o_acc, p_prev, kv_regs, st_o, pre = split_carry(it)
                 base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
                 for u in range_constexpr(UNROLL):
                     # Loop rotated: the closing barrier of each gate phase is
@@ -1535,8 +1537,8 @@ def build_hstu_attention_fwd_pp(
                     if const_expr(u == 0):
                         phase_barrier()
                     kv_tile = base + fx.Int32(u)
-                    o_acc, s_accs, kv_regs, st_a, st_t, pre = mfma_phase(
-                        o_acc, p_prev, kv_regs, st_a, st_t, pre, kv_tile, u
+                    o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
+                        o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u
                     )
                     phase_barrier()
                     p_flat = gate_phase(
@@ -1545,7 +1547,7 @@ def build_hstu_attention_fwd_pp(
                     p_prev = unflatten(p_flat)
                     if const_expr(u < UNROLL - 1):
                         phase_barrier()
-                loop_results = yield (o_acc + p_flat + kv_regs + st_a + st_t + pre)
+                loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre)
 
             # ---- Masked remainder + drain ----
             for _o1, it in range(
@@ -1554,7 +1556,7 @@ def build_hstu_attention_fwd_pp(
                 fx.Int32(1),
                 init=loop_results,
             ):  # ty: ignore
-                o_acc, p_prev, kv_regs, st_a, st_t, pre = split_carry(it)
+                o_acc, p_prev, kv_regs, st_o, pre = split_carry(it)
                 base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
                 for u in range_constexpr(UNROLL):
                     # Loop rotated: the closing barrier of each gate phase is
@@ -1566,8 +1568,8 @@ def build_hstu_attention_fwd_pp(
                     if const_expr(u == 0):
                         phase_barrier()
                     kv_tile = base + fx.Int32(u)
-                    o_acc, s_accs, kv_regs, st_a, st_t, pre = mfma_phase(
-                        o_acc, p_prev, kv_regs, st_a, st_t, pre, kv_tile, u
+                    o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
+                        o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u
                     )
                     phase_barrier()
                     p_flat = gate_phase(
@@ -1576,7 +1578,7 @@ def build_hstu_attention_fwd_pp(
                     p_prev = unflatten(p_flat)
                     if const_expr(u < UNROLL - 1):
                         phase_barrier()
-                loop_results = yield (o_acc + p_flat + kv_regs + st_a + st_t + pre)
+                loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre)
 
             # Closes the last sub-trip's gate phase, which the rotation left
             # without a trailing barrier inside the loop.
