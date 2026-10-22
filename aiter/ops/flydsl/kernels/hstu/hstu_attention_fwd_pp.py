@@ -108,6 +108,7 @@ oracle.
 """
 
 import functools
+import math
 import math as host_math
 
 import flydsl.compiler as flyc
@@ -542,6 +543,29 @@ def build_hstu_attention_fwd_pp(
     #
     # Widening costs registers: a batch of B holds B scores plus B
     # intermediates live at once. 4 -> 8 -> 16 -> 32 (one whole tile).
+    # ---- sigma(g) lookup table in LDS -------------------------------------
+    # Replace exp2 -> (1+e) -> rcp with one indexed read. Nearest-node, no
+    # interpolation: the worst case is half a step from a node, so the
+    # relative error of sigma (and hence of p, since p = g*sigma and g is
+    # exact) is ln2*(1-sigma)*h/2, worst as sigma->0. Setting that to bf16's
+    # 2^-8 gives h = 0.01125.
+    #
+    # Range: below g = -8, 1-sigma = 2^g < 2^-8 so sigma rounds to 1.0 in
+    # bf16; above g = +16, p = g*sigma ~ 2.4e-4, under bf16's noise floor.
+    # Span 24 / 0.01125 = 2135 entries x 4 B = 8540 B.
+    #
+    # The index CLAMP is the saturating branch, not a safety check: clamping
+    # to node 0 gives sigma ~ 1, and the surviving multiply then yields p = g
+    # for any g however negative. That is why the multiply cannot be folded
+    # into the table (a p-table clamps to a constant and is wrong by |g|).
+    USE_SIGMA_LUT = True
+    _LUT_GLO, _LUT_GHI = -8.0, 16.0
+    _LUT_H = 0.01125
+    _LUT_N = int(math.ceil((_LUT_GHI - _LUT_GLO) / _LUT_H)) + 1
+    _LUT_SCALE = 1.0 / _LUT_H
+    _LUT_BIAS = -_LUT_GLO / _LUT_H + 0.5   # +0.5 so truncation == round-to-nearest
+    _LUT_ROUNDS = (_LUT_N + BLOCK_THREADS - 1) // BLOCK_THREADS
+
     GATE_BATCH = 4
     assert GATE_BATCH % MFMA_ELEMS_PER_LANE == 0
 
@@ -587,6 +611,7 @@ def build_hstu_attention_fwd_pp(
         k1: fx.Array[elem_dtype, BLOCK_N * HEAD_DIM_K, 16]
         v0: fx.Array[elem_dtype, hidden_dim * V_T_STRIDE, 16]
         v1: fx.Array[elem_dtype, hidden_dim * V_T_STRIDE, 16]
+        lut: fx.Array[fx.Float32, _LUT_N if USE_SIGMA_LUT else 1, 16]
 
     # ---- Device Kernel ----
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
@@ -752,6 +777,7 @@ def build_hstu_attention_fwd_pp(
         # resolves to one named fx.Array field.
         k_smem = [lds.k0.view(k_layout), lds.k1.view(k_layout)]
         v_smem = [lds.v0.view(v_layout), lds.v1.view(v_layout)]
+        lut_mem = lds.lut.view(fx.make_layout((_LUT_N, 1), (1, 1)))
 
         # Single source of truth for the K LDS swizzle, expressed in MFMA_LANE_K-group units. The
         # full-column swizzle is col ^ ((row & (ROWS-1)) << SHIFT). Because MFMA_LANE_K == 1<<LOG2,
@@ -870,6 +896,38 @@ def build_hstu_attention_fwd_pp(
         def _rcp(x):
             return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
 
+        c_lut_scale = fx.Float32(_LUT_SCALE)
+        c_lut_bias = fx.Float32(_LUT_BIAS)
+        c_lut_hi = fx.Float32(float(_LUT_N - 1))
+
+        def lut_sigma(gv):
+            """sigma(g) = 1/(1+2^g) by table lookup. Four full-rate ops and one
+            ds_read, against v_exp_f32 + v_add_f32 + v_rcp_f32."""
+            t = gv * c_lut_scale + c_lut_bias
+            t = fx.Float32(
+                llvm.call_intrinsic(
+                    fx.Float32.ir_type,
+                    "llvm.amdgcn.fmed3.f32",
+                    [t.ir_value(), c_zero_f.ir_value(), c_lut_hi.ir_value()],
+                    [],
+                    [],
+                )
+            )
+            return Vec(lut_mem[t.to(fx.Int32), None].load())[0]
+
+        def build_sigma_lut():
+            """Fill the table once per workgroup. ~5 rounds over BLOCK_THREADS,
+            against the ~270 KV tiles that follow -- amortises to nothing."""
+            for r in range_constexpr(_LUT_ROUNDS):
+                _idx = tid + fx.Int32(r * BLOCK_THREADS)
+                # Clamp rather than branch: the surplus threads of the last
+                # round all write the LAST entry, and because the value is
+                # derived from the CLAMPED index they write the same bits, so
+                # the redundant stores are benign rather than a race.
+                _idx = (_idx < fx.Int32(_LUT_N)).select(_idx, fx.Int32(_LUT_N - 1))
+                _gv = _idx.to(fx.Float32) * fx.Float32(_LUT_H) + fx.Float32(_LUT_GLO)
+                lut_mem[_idx, fx.Int32(0)] = _rcp(c_one_f + exp2_f32(_gv))
+
         def silu_scale_batch(s_list):
             """silu(alpha*s) via the -log2e base change, stage-batched for ILP. Returns
             p = g*sigm with g = (alpha*-log2e)*s, so p = (-log2e)*silu(alpha*s); the -1/log2e is
@@ -882,9 +940,12 @@ def build_hstu_attention_fwd_pp(
             `v_mul_f32` at 516,224 executions against 258,048 gated elements --
             exactly two per element -- and this removes one of them."""
             g = s_list
-            emu = [exp2_f32(gi) for gi in g]
-            den = [c_one_f + e for e in emu]
-            sig = [_rcp(d) for d in den]
+            if const_expr(USE_SIGMA_LUT):
+                sig = [lut_sigma(gi) for gi in g]
+            else:
+                emu = [exp2_f32(gi) for gi in g]
+                den = [c_one_f + e for e in emu]
+                sig = [_rcp(d) for d in den]
             return [g[i] * sig[i] for i in range(len(s_list))]
 
         def to_id(x):
@@ -1727,6 +1788,8 @@ def build_hstu_attention_fwd_pp(
             # intervening publish. The backward shipped exactly that inversion
             # and it was nondeterministic at every geometry but its tuned one --
             # 0/63 runs there against 36/63 at another (fixed in e2a81264d).
+            if const_expr(USE_SIGMA_LUT):
+                build_sigma_lut()
             if is_g0:
                 phase_barrier()
             rocdl.s_waitcnt(vmcnt=0)
