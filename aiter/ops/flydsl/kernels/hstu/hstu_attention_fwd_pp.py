@@ -824,6 +824,9 @@ def build_hstu_attention_fwd_pp(
         c_alpha_neg_log2e = fx.Float32(alpha * -_LOG2E)
         c_one_f = fx.Float32(1.0)
         c_zero_f = fx.Float32(0.0)
+        # Column id for a position past the end of the sequence: larger than
+        # any query id, small enough that a query id minus it cannot wrap.
+        COL_OOB = fx.Int32(1 << 30)
 
         def _rcp(x):
             return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
@@ -1223,12 +1226,29 @@ def build_hstu_attention_fwd_pp(
                         kv_base + fx.Int32(i)
                         for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
+                    # Fold "this column is past the end of the sequence" into
+                    # the column's own coordinates instead of AND-ing it into
+                    # every (qg, i) predicate. An out-of-seq column gets a raw
+                    # position no query can equal and an id no query can
+                    # exceed, which kills the diagonal term, the causal term
+                    # and the contextual opener at once. That turns 32
+                    # `s_and_b64` into 2 selects per column -- the bound is
+                    # per-COLUMN but the AND was per (query, column).
+                    #
+                    # COL_OOB has to stay small enough that `q_id - COL_OOB`
+                    # does not wrap, because the windowed path still forms that
+                    # difference.
                     col_in_seq = [
                         col_raw[i] < seq_len
                         for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
+                    col_raw = [
+                        col_in_seq[i].select(col_raw[i], fx.Int32(-1))
+                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                    ]
                     col_id = [
-                        to_id(col_raw[i]) for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                        col_in_seq[i].select(to_id(col_raw[i]), COL_OOB)
+                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
                 for qg in range_constexpr(Q_SUBTILES):
                     cur = s_accs[ng][qg]
@@ -1240,6 +1260,22 @@ def build_hstu_attention_fwd_pp(
                         # bound at definition time -- B023's late-binding concern doesn't apply.
                         def keep_col(i):
                             """causal * window * contextual * target mask for (qg, col i)."""
+                            if const_expr(causal and not has_window):
+                                # `(q_id - col_id) > 0` is NOT folded to
+                                # `col_id < q_id` by the backend -- signed
+                                # subtraction can wrap -- so it costs a
+                                # `v_sub_u32` per element that nothing else
+                                # reads. Only the windowed path needs `dist`
+                                # itself.
+                                keep = (q_rows_i32[qg] == col_raw[i]) | (  # noqa: B023
+                                    col_id[i] < q_row_ids[qg]  # noqa: B023
+                                )
+                                if const_expr(has_contextual):
+                                    keep = keep | (
+                                        (q_row_ids[qg] == fx.Int32(0))  # noqa: B023
+                                        & (col_id[i] < max_id)  # noqa: B023
+                                    )
+                                return keep
                             dist = q_row_ids[qg] - col_id[i]  # noqa: B023
                             if not causal:
                                 # Non-causal: symmetric id distance |q - col|. With the diagonal
@@ -1261,7 +1297,6 @@ def build_hstu_attention_fwd_pp(
                                     col_id[i] < max_id  # noqa: B023
                                 )
                                 keep = keep | ctx
-                            keep = keep & col_in_seq[i]  # noqa: B023
                             return keep
 
                         s_vals = [
