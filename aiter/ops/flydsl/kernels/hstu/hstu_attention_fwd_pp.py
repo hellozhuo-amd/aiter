@@ -530,6 +530,22 @@ def build_hstu_attention_fwd_pp(
     # `kv_stage_tile`.
     V_ROT_DT = 1
 
+    # ---- Phase V: how many score elements the gate pipelines at once --------
+    # The gate is exp2 -> add -> rcp -> mul, four SERIALLY DEPENDENT ops per
+    # element, and the only thing hiding each one's latency is the other
+    # elements in flight. The natural batch is one MFMA accumulator --
+    # MFMA_ELEMS_PER_LANE = 4 -- and off the trace that is too narrow: the
+    # emitted stream is `exp x4 | add x4 | rcp x4 | mul x4 | perm x2` and every
+    # transcendental after the first in its run costs 20 cy against a 16 cy
+    # issue rate, with another 4 cy at each opcode transition. ~260 cy of a
+    # 1603 cy phase.
+    #
+    # Widening costs registers: a batch of B holds B scores plus B
+    # intermediates live at once. 4 -> 8 -> 16 -> 32 (one whole tile).
+    GATE_BATCH = 4
+    assert GATE_BATCH % MFMA_ELEMS_PER_LANE == 0
+
+
     # The cross-phase head must be d-chunk-0 PV units ONLY. The rotation covers
     # exactly V_ROT_DT d-chunks, so a QK unit in the head would need K rotated
     # too -- which the interleaved order would otherwise force, since it
@@ -1192,10 +1208,10 @@ def build_hstu_attention_fwd_pp(
             apply_mask=False skips the per-element mask (and the column position/bounds math it
             needs). Only valid for a tile that is fully in-seq and fully valid -- see the causal
             unmasked-range split in the main loop."""
-            p_packs = [
-                [None for _ in range_constexpr(Q_SUBTILES)]
-                for _ in range_constexpr(KV_SUBTILES)
-            ]
+            # The masked scores of the WHOLE tile, in (ng, qg, i) order, so that
+            # every aligned run of MFMA_ELEMS_PER_LANE is one accumulator and
+            # the gate can be batched across accumulators (see GATE_BATCH).
+            flat = []
             for ng in range_constexpr(KV_SUBTILES):
                 if const_expr(apply_mask):
                     kv_base = (
@@ -1252,8 +1268,20 @@ def build_hstu_attention_fwd_pp(
                             keep_col(i).select(s_vals[i], c_zero_f)
                             for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                         ]
-                    p_packs[ng][qg] = pack_p(silu_scale_batch(s_vals))
-            return p_packs
+                    flat.extend(s_vals)
+
+            gated = []
+            for b in range_constexpr(0, len(flat), GATE_BATCH):
+                gated.extend(silu_scale_batch(flat[b : b + GATE_BATCH]))
+
+            E = MFMA_ELEMS_PER_LANE
+            return [
+                [
+                    pack_p(gated[(ng * Q_SUBTILES + qg) * E :][:E])
+                    for qg in range_constexpr(Q_SUBTILES)
+                ]
+                for ng in range_constexpr(KV_SUBTILES)
+            ]
 
         # ==== GEMM2: P*V -> O (V as natural-layout operand B; P as operand A) ====
         # ==== The two phases ====
