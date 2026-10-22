@@ -114,7 +114,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import T, Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
@@ -792,13 +792,52 @@ def build_hstu_attention_fwd_pp(
                 << fx.Int32(K_SWZ_SHIFT - MFMA_DIM_LANE_K_LOG2)
             )
 
-        q_wave_base = q_tile_idx * fx.Int32(BLOCK_M) + wave_id * fx.Int32(ROWS_PER_WAVE)
+        # ---- Which 16-row blocks of the Q tile this wave owns ---------------
+        # Contiguous (`wave_id * ROWS_PER_WAVE + qg * MFMA_M`) hands wave w the
+        # rows [w*ROWS_PER_WAVE, +ROWS_PER_WAVE), so its Q_SUBTILES blocks are
+        # ADJACENT. That concentrates the causal diagonal: over the masked
+        # remainder, every tile has some wave sitting entirely below the
+        # diagonal, which must gate all of its sub-blocks. Phase V ends at a
+        # barrier, so the workgroup pays that wave -- and skipping the
+        # fully-masked sub-blocks would recover 5% of the gate.
+        #
+        # Interleaving the blocks instead (wave w owns w, w+NUM_WAVES,
+        # w+2*NUM_WAVES, ...) makes every wave straddle the whole Q tile, so
+        # the diagonal is spread evenly and max-over-waves falls to 62% of the
+        # gate and 12.5% of the mask (the floor for any mapping is 56%).
+        #
+        # Nothing else depends on a wave's rows being contiguous: a wave still
+        # reads and writes MFMA_M consecutive rows per sub-tile, so the Q load
+        # and the O store keep their coalescing.
+        #
+        # MEASURED OFF, because it is not free: 115.0 -> 116.3/116.5 ms over two
+        # runs, a reproducible +1.2% with no other change. The balance is tied
+        # to how far a wave's blocks are spread (span 384 rows gives gate 80,
+        # span 192 gives 104, span 48 -- contiguous -- gives 122), so there is
+        # no cheap middle. Against the masked loop's 4.3% ceiling that leaves
+        # ~1.9% net, where branching on the contiguous mapping alone already
+        # takes ~0.9% for free: it recovers only 5% of the GATE but 75% of the
+        # MASK, which does not depend on the spread.
+        Q_BLK_INTERLEAVE = True
+        q_tile_base = q_tile_idx * fx.Int32(BLOCK_M)
+
+        def q_blk_base(qg):
+            """First row of this wave's `qg`-th 16-row block of the Q tile."""
+            if const_expr(Q_BLK_INTERLEAVE):
+                return q_tile_base + (
+                    wave_id + fx.Int32(qg * NUM_WAVES)
+                ) * fx.Int32(MFMA_M)
+            return (
+                q_tile_base
+                + wave_id * fx.Int32(ROWS_PER_WAVE)
+                + fx.Int32(qg * MFMA_M)
+            )
 
         # ---- Q rows / bounds per query sub-tile ----
         q_rows = []
         q_in_bounds = []
         for qg in range_constexpr(Q_SUBTILES):
-            local = q_wave_base + fx.Int32(qg * MFMA_M) + lane_mod_16
+            local = q_blk_base(qg) + lane_mod_16
             q_rows.append(local)
             q_in_bounds.append(local < seq_len)
 
@@ -958,6 +997,36 @@ def build_hstu_attention_fwd_pp(
             if const_expr(has_contextual):
                 _b = (q_row_ids[qg] > fx.Int32(0)).select(_b, _id_ceiling)
             q_border.append(_b)
+
+        # ---- Wave-uniform bounds, for the per-sub-block diagonal test -------
+        # A 16x16 (qg, ng) sub-block is entirely below the diagonal, entirely
+        # above it, or straddling it, and which one is decided by numbers that
+        # are constant across the wave. Skipping the gate on an above-diagonal
+        # block and the mask on a below-diagonal one is then an SALU branch,
+        # not an exec mask -- but only if the compiler can SEE the condition is
+        # uniform. `wave_id` is `tid // WARP_SIZE`, which its divergence
+        # analysis treats as per-lane, so pin it through readfirstlane.
+        #
+        # Used ONLY in the predicates. The data path keeps the original values
+        # so nothing else in the kernel changes shape.
+        def _sgpr32(x):
+            return fx.Int32(rocdl.readfirstlane(T.i32, x.ir_value()))
+
+        q_blk_lo = [_sgpr32(q_blk_base(qg)) for qg in range_constexpr(Q_SUBTILES)]
+        q_blk_hi = [x + fx.Int32(MFMA_M - 1) for x in q_blk_lo]
+        # The border is monotone non-decreasing in the row only when there is
+        # no contextual prefix (whose rows all carry the ceiling), which is the
+        # same condition the unmasked/masked split already requires.
+        SUBBLK_SKIP = causal and not has_window and not has_contextual
+        if const_expr(SUBBLK_SKIP):
+            def _row_border(r):
+                b = r + fx.Int32(1)
+                if const_expr(has_targets):
+                    b = (b < _id_ceiling).select(b, _id_ceiling)
+                return b
+
+            q_blk_blo = [_row_border(x) for x in q_blk_lo]
+            q_blk_bhi = [_row_border(x) for x in q_blk_hi]
 
         # ---- KV range: causal upper bound + active predicate ----
         q_start = q_tile_idx * fx.Int32(BLOCK_M)
@@ -1236,12 +1305,86 @@ def build_hstu_attention_fwd_pp(
                 rocdl.sched_barrier(0)
             return o_acc, s_accs, nxt
 
+        c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
+
+        def gate_tile_split(kv_start, s_accs):
+            """PHASE V for a tile that STRADDLES the causal diagonal.
+
+            The masked remainder is BLOCK_M/BLOCK_N tiles wide, and inside it
+            most 16x16 (qg, ng) sub-blocks are not on the diagonal at all --
+            they are entirely below it (every element kept, so the mask is
+            pure overhead) or entirely above it (every element zeroed, so the
+            gate is too: a zeroed score gates to exactly 0). Only the blocks
+            the diagonal passes through need both.
+
+            The test is wave-uniform, so each arm is an SALU branch. What it
+            can recover is bounded by the BARRIER at the end of phase V: the
+            workgroup pays the MAX over its 8 waves, and with the contiguous
+            q-block mapping every remainder tile has some wave sitting wholly
+            below the diagonal, which still gates all 8 of its sub-blocks. So
+            this takes ~75% of the MASK and almost none of the GATE. See
+            Q_BLK_INTERLEAVE for what would unlock the rest, and what it
+            costs.
+            """
+            p_packs = []
+            for ng in range_constexpr(KV_SUBTILES):
+                kv_lo = kv_start + fx.Int32(ng * MFMA_M)
+                kv_hi = kv_lo + fx.Int32(MFMA_M - 1)
+                kv_base = kv_lo + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                col_raw = [
+                    kv_base + fx.Int32(i)
+                    for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                ]
+                col_raw = [
+                    (c < seq_len).select(c, COL_OOB) for c in col_raw
+                ]
+                row = []
+                for qg in range_constexpr(Q_SUBTILES):
+                    cur = s_accs[ng][qg]
+                    s_vals = [
+                        Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                    ]
+                    # Above the diagonal: every column is past every row's
+                    # border AND cannot be any row's own token. Or the whole
+                    # block is past the end of the sequence.
+                    all_drop = (kv_lo >= seq_len) | (
+                        (kv_lo > q_blk_hi[qg]) & (kv_lo >= q_blk_bhi[qg])
+                    )
+                    # Below it: every column is inside the sequence and under
+                    # the LOWEST row's border (the border is monotone here).
+                    all_keep = (kv_hi < q_blk_blo[qg]) & (kv_hi < seq_len)
+                    # Pre-bound: FlyDSL yields the names an `if` ASSIGNS, and
+                    # it passes their current values in as the else-of-last-
+                    # resort, so they have to exist before the branch.
+                    pk = c_zero_pack
+                    if all_drop:
+                        pk = c_zero_pack
+                    elif all_keep:
+                        pk = pack_p(silu_scale_batch(s_vals))
+                    else:
+                        kept = [
+                            (
+                                (col_raw[i] < q_border[qg])
+                                | (col_raw[i] == q_rows_i32[qg])
+                                if const_expr(has_targets)
+                                else col_raw[i] < q_border[qg]
+                            ).select(s_vals[i], c_zero_f)
+                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                        ]
+                        pk = pack_p(silu_scale_batch(kept))
+                    row.append(pk)
+                p_packs.append(row)
+            return p_packs
+
         def gate_tile(kv_start, s_accs, apply_mask=True):
             """PHASE V. Mask + silu gate -> P packs. No memory operation at all.
 
             apply_mask=False skips the per-element mask (and the column position/bounds math it
             needs). Only valid for a tile that is fully in-seq and fully valid -- see the causal
             unmasked-range split in the main loop."""
+            if const_expr(apply_mask and SUBBLK_SKIP):
+                return gate_tile_split(kv_start, s_accs)
+
             # The masked scores of the WHOLE tile, in (ng, qg, i) order, so that
             # every aligned run of MFMA_ELEMS_PER_LANE is one accumulator and
             # the gate can be batched across accumulators (see GATE_BATCH).
@@ -1357,7 +1500,6 @@ def build_hstu_attention_fwd_pp(
         # ==== GEMM2: P*V -> O (V as natural-layout operand B; P as operand A) ====
         # ==== The two phases ====
         N_PACK = KV_SUBTILES * Q_SUBTILES
-        c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
         def mfma_phase(o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u):
             """PHASE M: both GEMMs, their LDS operand feed, and this group's staging.
@@ -1690,18 +1832,14 @@ def build_hstu_attention_fwd_pp(
             # ---- Epilogue: store O (1/N hoisted here) ----
             # GEMM2 writes a transposed C fragment: A=P, B=V, C[d, query].
             # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
-            # therefore q_wave_base + qg*16 + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
+            # therefore q_blk_base(qg) + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
             results = (
                 list(loop_results)
                 if isinstance(loop_results, (list, tuple))
                 else [loop_results]
             )
             for qg in range_constexpr(Q_SUBTILES):
-                q_row_base = (
-                    q_wave_base
-                    + fx.Int32(qg * MFMA_M)
-                    + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                )
+                q_row_base = q_blk_base(qg) + lane_div_16 * fx.Int32(MFMA_LANE_K)
                 for e in range_constexpr(MFMA_ELEMS_PER_LANE):
                     q_row_e = q_row_base + fx.Int32(e)
                     if q_row_e < seq_len:
