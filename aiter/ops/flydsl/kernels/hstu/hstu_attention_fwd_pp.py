@@ -574,6 +574,11 @@ def build_hstu_attention_fwd_pp(
     #   4 -> 105.28 ms | 16 -> 106.28 | 32 -> 103.70   (means of 2 runs,
     #   shipping control stable within 0.6%)
     SPECIALISE_DUTY = True
+    # Issue the staging ds_writes AHEAD of the MFMA burst (see mfma_phase).
+    # Issue the staging stores STORE_LEAD units before the end of the MFMA
+    # burst, so the remaining MFMAs cover their latency (see mfma_burst).
+    INTERLEAVE_STORE = True
+    STORE_LEAD = 3
     GATE_BATCH = 32
     assert GATE_BATCH % MFMA_ELEMS_PER_LANE == 0
 
@@ -1342,7 +1347,7 @@ def build_hstu_attention_fwd_pp(
                 )
             return o_acc, s_accs
 
-        def mfma_burst(o_acc, p_packs, carried, ks_mem, vs_mem):
+        def mfma_burst(o_acc, p_packs, carried, ks_mem, vs_mem, tail_store=None):
             """PHASE M's whole MFMA stream: GEMM1 of this tile merged with GEMM2
             of the previous one, walked as one `UNIT_ORDER` sequence.
 
@@ -1388,6 +1393,22 @@ def build_hstu_attention_fwd_pp(
                     nxt[sn - N_UNITS] = read_unit(
                         UNIT_ORDER[sn - N_UNITS], ks_mem, vs_mem
                     )
+                # Staging stores, issued STORE_LEAD units before the end of
+                # the burst instead of after it. An MFMA issues in 4 cy and
+                # then owns the matrix pipe for 16, so a non-MFMA slots into
+                # that shadow -- the trace shows `v_mfma dur 4` whenever a
+                # non-MFMA follows and `dur 16` only between back-to-back
+                # MFMAs. Placed here, the remaining units' MFMAs cover the
+                # stores' latency before the phase's closing lgkmcnt(0).
+                #
+                # The only reads issued after them are the CROSS-PHASE
+                # prefetches into `nxt`, whose consumer sits past the phase
+                # barrier and so waits on that barrier's lgkmcnt(0) anyway.
+                # The counted waits of this phase's own operand reads are
+                # untouched -- which is what sank hoisting the stores to the
+                # TOP of the phase.
+                if const_expr(tail_store is not None and step == N_UNITS - STORE_LEAD):
+                    tail_store()
                 rocdl.sched_barrier(0)
             return o_acc, s_accs, nxt
 
@@ -1602,69 +1623,61 @@ def build_hstu_attention_fwd_pp(
             v_cur = u % V_SLOTS
             v_prev = (u + 1) % V_SLOTS
 
-            # ORDER IS LOAD-BEARING: every operand ds_read is issued BEFORE the
-            # staging ds_writes below, and the drain for those writes is
-            # therefore lgkmcnt(0) at the bottom of this phase.
+            # STAGING STORES GO FIRST, ahead of the operand burst.
             #
-            # The tempting alternative -- hoist the store to the TOP so a
-            # COUNTED lgkmcnt(PREFETCH_DEPTH) can drain it at the bottom while
-            # the tail's prefetch reads stay in flight, letting the scatter
-            # overlap the burst -- was built and measured at 137.4 ms against
-            # 121.0, a 13.6% REGRESSION. `lgkmcnt` retires in order, so a
-            # store-first order puts all 16 operand reads behind a per-element
-            # b16 scatter, and the 8 MFMAs that the cross-phase prefetch can
-            # cover are not enough to hide it. The scatter's bank-conflicted
-            # LATENCY, not its issue cost, is what the reads end up waiting on.
+            # This was long forbidden here, and for a real reason: `lgkmcnt` is
+            # a single IN-ORDER counter, so a read issued after a store cannot
+            # be known complete until that store retires, whatever buffer each
+            # touches. (There is no DATA hazard -- the write target is the slot
+            # the burst is not reading: k_fill vs k_cur, v_cur vs v_prev. The
+            # coupling is purely through the counter.) Hoisting the store was
+            # built once and measured 137.4 ms against 121.0, a 13.6%
+            # REGRESSION, with all 16 operand reads stuck behind a
+            # bank-conflicted b16 scatter.
             #
-            # So the counted-wait idea is sound in the abstract and dead in
-            # practice here: the only thing it can drain early is a store that
-            # was issued early, and issuing the store early costs more than the
-            # drain saves.
-            # lgkmcnt retires in order, and the V store is a per-element b16
-            # transpose scatter; putting it first would make these reads wait on
-            # the scatter and turn an lgkmcnt(3) into an lgkmcnt(0) ahead of the
-            # MFMAs.
+            # That measurement no longer holds. Re-run against the current
+            # kernel it is a small WIN: 97.30 vs 97.83 ms, -0.5% over two
+            # interleaved pairs. What changed is the duty specialisation
+            # (eb68b017a) -- each arm now carries only its OWN store shape, so
+            # a g0 wave puts 2 `ds_write_b64` in front of the burst instead of
+            # branching around a 10-store block. Two b64 stores are a much
+            # cheaper thing for the counter to retire than the b16 scatter the
+            # original measurement was fighting.
+            #
+            # Keep this under review if the staging shape changes again: the g1
+            # arm still writes 8 b16, and the conclusion is sensitive to that.
             # One contiguous MFMA burst: GEMM1 of this tile merged with GEMM2
             # of the previous one. `p_prev` is the previous tile's gate output
             # and v_smem[v_prev] its V slot -- the rotation. Tiles still land in
             # the accumulator in ascending order, only one trip later, so this
             # stays bitwise identical to the unrotated kernel.
-            o_acc, s_accs, pre_next = mfma_burst(
-                o_acc, p_prev, pre, k_smem[k_cur], v_smem[v_prev]
-            )
-
-            # Publish the set issued one phase pair ago, then issue the next.
-            # Each group writes ONE tensor, never both: g0's M(i) writes only
-            # K(i+1), g1's M(i) writes only V(i). So g0's staged TILE INDEX runs
-            # one ahead of g1's, and one select covers the difference. (Not to
-            # be confused with the phase skew, which runs the other way: g0
-            # burns the extra prologue barrier, so g0 is the group that LAGS.)
-            #
-            # THIS is where the staging load is waited -- immediately ahead of
-            # the ds_write that consumes it, and nowhere else. At this point the
-            # only load outstanding is the one issued in the PREVIOUS M phase, so
-            # `vmcnt(0)` here costs nothing and the load has had a full M+V pair
-            # to return. Waiting after the issue below instead would drain the
-            # load fired moments earlier and collapse the pipeline to depth 1 --
-            # the stall this kernel exists to remove.
-            rocdl.s_waitcnt(vmcnt=0)
-            # `kv_regs` was issued in M(i-1) and is RAW -- the zero-fold happens
-            # here, at the consumer, so that the `v_cndmask` is not what forces
-            # the wait above. The tile it belongs to is one ahead of this one for
-            # g0 (which writes K(i+1)) and this very tile for g1 (which writes
-            # V(i)); mirrors the `next_tile` offsets below, shifted by a phase.
-            kv_vals = kv_regs
-            if const_expr(g0 is None):
-                if is_g0:
-                    store_k_regs_to_lds(kv_vals, k_smem[k_fill])
+            def _stage_store():
+                rocdl.s_waitcnt(vmcnt=0)
+                if const_expr(g0 is None):
+                    if is_g0:
+                        store_k_regs_to_lds(kv_regs, k_smem[k_fill])
+                    else:
+                        store_v_regs_to_lds(kv_regs, v_smem[v_cur])
+                elif const_expr(g0):
+                    store_k_regs_to_lds(kv_regs, k_smem[k_fill])
                 else:
-                    store_v_regs_to_lds(kv_vals, v_smem[v_cur])
-            elif const_expr(g0):
-                # Duty resolved at TRACE time: no runtime branch, so the scf.if
-                # and its rejoin leave the hot loop entirely.
-                store_k_regs_to_lds(kv_vals, k_smem[k_fill])
-            else:
-                store_v_regs_to_lds(kv_vals, v_smem[v_cur])
+                    store_v_regs_to_lds(kv_regs, v_smem[v_cur])
+
+            o_acc, s_accs, pre_next = mfma_burst(
+                o_acc, p_prev, pre, k_smem[k_cur], v_smem[v_prev],
+                tail_store=_stage_store if const_expr(INTERLEAVE_STORE) else None,
+            )
+            if const_expr(not INTERLEAVE_STORE):
+                rocdl.s_waitcnt(vmcnt=0)
+                if const_expr(g0 is None):
+                    if is_g0:
+                        store_k_regs_to_lds(kv_regs, k_smem[k_fill])
+                    else:
+                        store_v_regs_to_lds(kv_regs, v_smem[v_cur])
+                elif const_expr(g0):
+                    store_k_regs_to_lds(kv_regs, k_smem[k_fill])
+                else:
+                    store_v_regs_to_lds(kv_regs, v_smem[v_cur])
             rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_KV, 0)
 
             # Issued now, ds_written in M(i+1), so it targets M(i+1)'s staged
