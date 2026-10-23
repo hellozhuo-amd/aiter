@@ -578,6 +578,7 @@ def build_hstu_attention_fwd_pp(
     # Issue the staging stores STORE_LEAD units before the end of the MFMA
     # burst, so the remaining MFMAs cover their latency (see mfma_burst).
     INTERLEAVE_STORE = True
+    GATE_HALVES = True
     GATE_BATCH = 32
     assert GATE_BATCH % MFMA_ELEMS_PER_LANE == 0
 
@@ -928,7 +929,7 @@ def build_hstu_attention_fwd_pp(
         c_lut_lo = fx.Float32(_LUT_MAGIC)
         c_lut_hi = fx.Float32(_LUT_MAGIC + float(_LUT_N - 1))
 
-        def lut_sigma(gv):
+        def lut_index(gv):
             """sigma(g) = 1/(1+2^g) by table lookup. Three full-rate ops and
             one ds_read, against v_exp_f32 + v_add_f32 + v_rcp_f32."""
             t = gv * c_lut_scale + c_lut_big
@@ -941,8 +942,13 @@ def build_hstu_attention_fwd_pp(
                     [],
                 )
             )
-            idx = (t.bitcast(fx.Int32) >> fx.Int32(2)) & fx.Int32(0x1FFFFF)
+            return (t.bitcast(fx.Int32) >> fx.Int32(2)) & fx.Int32(0x1FFFFF)
+
+        def lut_load(idx):
             return Vec(lut_mem[idx, None].load())[0]
+
+        def lut_sigma(gv):
+            return lut_load(lut_index(gv))
 
         def build_sigma_lut():
             """Fill the table once per workgroup. ~5 rounds over BLOCK_THREADS,
@@ -1633,9 +1639,38 @@ def build_hstu_attention_fwd_pp(
                         ]
                     flat.extend(s_vals)
 
-            gated = []
-            for b in range_constexpr(0, len(flat), GATE_BATCH):
-                gated.extend(silu_scale_batch(flat[b : b + GATE_BATCH]))
+            if const_expr(USE_SIGMA_LUT and GATE_HALVES):
+                # Split the tile in half and software-pipeline the LUT reads.
+                #
+                # Emitted as one block, the 32 reads are issued and then
+                # consumed: the first `s_waitcnt` covers 18 multiplies and the
+                # remaining 14 each need their own, 60 cy of waits against a
+                # `ds_read` measuring 9.50 cy/op.
+                #
+                # Interleaving the halves puts the SECOND half's address math
+                # (3 ops x 16 elements) between the first half's reads and
+                # their consumers, so those reads get ~48 instructions of cover
+                # instead of none.
+                #
+                # Note the address math CANNOT move a phase earlier: `g` is
+                # produced by GEMM1 in the M phase immediately before this one,
+                # so there is nothing to compute in V(i-1).
+                _h = len(flat) // 2
+                rocdl.sched_barrier(0)
+                _i0 = [lut_index(x) for x in flat[:_h]]
+                rocdl.sched_barrier(0)
+                _s0 = [lut_load(x) for x in _i0]
+                rocdl.sched_barrier(0)
+                _i1 = [lut_index(x) for x in flat[_h:]]
+                rocdl.sched_barrier(0)
+                _s1 = [lut_load(x) for x in _i1]
+                rocdl.sched_barrier(0)
+                gated = [flat[k] * _s0[k] for k in range_constexpr(_h)]
+                gated += [flat[_h + k] * _s1[k] for k in range_constexpr(len(flat) - _h)]
+            else:
+                gated = []
+                for b in range_constexpr(0, len(flat), GATE_BATCH):
+                    gated.extend(silu_scale_batch(flat[b : b + GATE_BATCH]))
 
             E = MFMA_ELEMS_PER_LANE
             return [
