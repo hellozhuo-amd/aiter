@@ -578,7 +578,6 @@ def build_hstu_attention_fwd_pp(
     # Issue the staging stores STORE_LEAD units before the end of the MFMA
     # burst, so the remaining MFMAs cover their latency (see mfma_burst).
     INTERLEAVE_STORE = True
-    STORE_LEAD = 3
     GATE_BATCH = 32
     assert GATE_BATCH % MFMA_ELEMS_PER_LANE == 0
 
@@ -1249,11 +1248,18 @@ def build_hstu_attention_fwd_pp(
                 for b in range_constexpr(NUM_BATCHES_KV)
             ]
 
-        def store_k_regs_to_lds(vecs, ks_mem):
-            """g0 only: write K vecs to LDS at XOR-swizzled columns."""
+        def store_k_regs_to_lds(vecs, ks_mem, part=None):
+            """g0 only: write K vecs to LDS at XOR-swizzled columns.
+
+            `part` selects ONE of the N_STORE_K slices, so the caller can
+            scatter them between individual MFMAs (see mfma_burst)."""
+            _n = -1
             for b in range_constexpr(NUM_BATCHES_KV):
                 row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
                 for h in range_constexpr(VEC_KV // MFMA_DIM_LANE_K):
+                    _n += 1
+                    if const_expr(part is not None and _n != part):
+                        continue
                     col_grp = kv_col_grp + fx.Int32(h)
                     half = Vec.from_elements(
                         [
@@ -1264,7 +1270,7 @@ def build_hstu_attention_fwd_pp(
                     )
                     ks_mem[row, k_swz_grp(row, col_grp), None].store(half)
 
-        def store_v_regs_to_lds(vecs, vs_mem):
+        def store_v_regs_to_lds(vecs, vs_mem, part=None):
             """g1 only: write V vecs to LDS transposed to V[d, kv] so GEMM2 can read 4
             consecutive kv per ds_read_b64. The lane's VEC_KV d-contiguous elements
             scatter to kv-fixed, d-varying LDS slots."""
@@ -1273,12 +1279,16 @@ def build_hstu_attention_fwd_pp(
             # it (and the XOR) out of the j loop turns 8 div/and/xor chains into
             # one; left inside, the live ranges cost 24 VGPR and 5 spills.
             vkey = v_swz_key(kv_col)
+            _n = -1
             for b in range_constexpr(NUM_BATCHES_KV):
                 kv_row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
                 swz_grp = (kv_row // fx.Int32(MFMA_LANE_K)) ^ vkey
                 kv_lane = kv_row % fx.Int32(MFMA_LANE_K)
                 vv = Vec(vecs[b])
                 for j in range_constexpr(VEC_KV):
+                    _n += 1
+                    if const_expr(part is not None and _n != part):
+                        continue
                     vs_mem[kv_col + fx.Int32(j), swz_grp, kv_lane] = vv[j]
 
         # ==== GEMM1: Q*K^T -> P (P fragment already in GEMM2 A-operand layout) ====
@@ -1309,7 +1319,7 @@ def build_hstu_attention_fwd_pp(
             kv_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
             return vs_mem[d_col, v_swz_grp(d_col, kv_grp), None].load().ir_value()
 
-        def gemm1_unit(s_accs, ng, ks, k_pack):
+        def gemm1_unit(s_accs, ng, ks, k_pack, hook=None):
             """The Q_SUBTILES MFMAs of one QK unit, chained on s_accs[ng][*]."""
             for qg in range_constexpr(Q_SUBTILES):
                 # Operand swap: A=K, B=Q (not A=Q, B=K) so the MFMA result P lands directly in
@@ -1318,13 +1328,17 @@ def build_hstu_attention_fwd_pp(
                 s_accs[ng][qg] = dim_mfma_acc(
                     Vec(k_pack).ir_value(), q_op, s_accs[ng][qg]
                 )
+                if const_expr(hook is not None):
+                    hook()
             return s_accs
 
-        def gemm2_unit(o_acc, p_packs, c, ng, v_pack):
+        def gemm2_unit(o_acc, p_packs, c, ng, v_pack, hook=None):
             """The Q_SUBTILES MFMAs of one PV unit, chained on o_acc[c*Q+*]."""
             for qg in range_constexpr(Q_SUBTILES):
                 off = c * Q_SUBTILES + qg
                 o_acc[off] = mfma_acc(p_packs[ng][qg], v_pack, o_acc[off])
+                if const_expr(hook is not None):
+                    hook()
             return o_acc
 
         def read_unit(spec, ks_mem, vs_mem):
@@ -1334,16 +1348,16 @@ def build_hstu_attention_fwd_pp(
                 return read_k_unit(j % KV_SUBTILES, j // KV_SUBTILES, ks_mem)
             return read_v_unit(j % D_CHUNKS, j // D_CHUNKS, vs_mem)
 
-        def apply_unit(spec, operand, o_acc, s_accs, p_packs):
+        def apply_unit(spec, operand, o_acc, s_accs, p_packs, hook=None):
             """The Q_SUBTILES MFMAs of unit `spec`, consuming `operand`."""
             kind, j = spec
             if const_expr(kind == "qk"):
                 s_accs = gemm1_unit(
-                    s_accs, j % KV_SUBTILES, j // KV_SUBTILES, operand
+                    s_accs, j % KV_SUBTILES, j // KV_SUBTILES, operand, hook
                 )
             else:
                 o_acc = gemm2_unit(
-                    o_acc, p_packs, j % D_CHUNKS, j // D_CHUNKS, operand
+                    o_acc, p_packs, j % D_CHUNKS, j // D_CHUNKS, operand, hook
                 )
             return o_acc, s_accs
 
@@ -1367,6 +1381,35 @@ def build_hstu_attention_fwd_pp(
             # units ahead. `sched_barrier` on both sides of each step is what
             # holds the pattern: without it the scheduler hoists every read to
             # the head of the phase and the window stops meaning anything.
+            # One staging store after each of the LAST n_store MFMAs, so each
+            # lands in the 12 cy of matrix-pipe shadow behind its MFMA (an MFMA
+            # issues in 4 cy and then owns the pipe for 16; the per-wave
+            # timeline shows `v_mfma dur 4` whenever a non-MFMA follows and
+            # `dur 16` only between back-to-back MFMAs).
+            #
+            # g0 writes 2 ds_write_b64 -> after MFMA #-3 and #-2.
+            # g1 writes 8 ds_write_b16 -> after MFMA #-9 .. #-2.
+            _n_mfma = [0]
+            _n_store = 0 if tail_store is None else tail_store[0]
+            _first = N_UNITS * Q_SUBTILES - _n_store - 1
+
+            def _hook():
+                m = _n_mfma[0]
+                _n_mfma[0] = m + 1
+                if const_expr(tail_store is None or m < _first):
+                    return
+                k = m - _first
+                if const_expr(k >= _n_store):
+                    return
+                if const_expr(k == 0):
+                    rocdl.s_waitcnt(vmcnt=0)
+                # Fence each store individually: `sched_barrier` only guards
+                # the unit boundaries, so without this the scheduler regroups
+                # them back into one clump and the per-MFMA shadows are lost.
+                rocdl.sched_barrier(0)
+                tail_store[1](k)
+                rocdl.sched_barrier(0)
+
             win = [None for _ in range_constexpr(WIN_RING)]
             # Seeded from the PREVIOUS phase's tail, so the first MFMA of the
             # burst issues with nothing outstanding.
@@ -1378,7 +1421,8 @@ def build_hstu_attention_fwd_pp(
             for step in range_constexpr(N_UNITS):
                 rocdl.sched_barrier(0)
                 o_acc, s_accs = apply_unit(
-                    UNIT_ORDER[step], win[step % WIN_RING], o_acc, s_accs, p_packs
+                    UNIT_ORDER[step], win[step % WIN_RING], o_acc, s_accs,
+                    p_packs, _hook,
                 )
                 sn = step + PREFETCH_DEPTH
                 if const_expr(sn < N_UNITS):
@@ -1407,8 +1451,6 @@ def build_hstu_attention_fwd_pp(
                 # The counted waits of this phase's own operand reads are
                 # untouched -- which is what sank hoisting the stores to the
                 # TOP of the phase.
-                if const_expr(tail_store is not None and step == N_UNITS - STORE_LEAD):
-                    tail_store()
                 rocdl.sched_barrier(0)
             return o_acc, s_accs, nxt
 
@@ -1651,23 +1693,27 @@ def build_hstu_attention_fwd_pp(
             # and v_smem[v_prev] its V slot -- the rotation. Tiles still land in
             # the accumulator in ascending order, only one trip later, so this
             # stays bitwise identical to the unrotated kernel.
-            def _stage_store():
-                rocdl.s_waitcnt(vmcnt=0)
-                if const_expr(g0 is None):
-                    if is_g0:
-                        store_k_regs_to_lds(kv_regs, k_smem[k_fill])
-                    else:
-                        store_v_regs_to_lds(kv_regs, v_smem[v_cur])
-                elif const_expr(g0):
-                    store_k_regs_to_lds(kv_regs, k_smem[k_fill])
-                else:
-                    store_v_regs_to_lds(kv_regs, v_smem[v_cur])
+            _N_STORE_K = NUM_BATCHES_KV * (VEC_KV // MFMA_DIM_LANE_K)
+            _N_STORE_V = NUM_BATCHES_KV * VEC_KV
+
+            def _store_k(k):
+                store_k_regs_to_lds(kv_regs, k_smem[k_fill], part=k)
+
+            def _store_v(k):
+                store_v_regs_to_lds(kv_regs, v_smem[v_cur], part=k)
+
+            if const_expr(g0 is None):
+                _ts = None          # unspecialised: keep the old whole-block form
+            elif const_expr(g0):
+                _ts = (_N_STORE_K, _store_k)
+            else:
+                _ts = (_N_STORE_V, _store_v)
 
             o_acc, s_accs, pre_next = mfma_burst(
                 o_acc, p_prev, pre, k_smem[k_cur], v_smem[v_prev],
-                tail_store=_stage_store if const_expr(INTERLEAVE_STORE) else None,
+                tail_store=_ts if const_expr(INTERLEAVE_STORE) else None,
             )
-            if const_expr(not INTERLEAVE_STORE):
+            if const_expr(not INTERLEAVE_STORE or g0 is None):
                 rocdl.s_waitcnt(vmcnt=0)
                 if const_expr(g0 is None):
                     if is_g0:
