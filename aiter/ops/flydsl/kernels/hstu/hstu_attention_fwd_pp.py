@@ -903,24 +903,41 @@ def build_hstu_attention_fwd_pp(
         def _rcp(x):
             return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
 
+        # ---- Index via the magic-number trick -------------------------------
+        # Biasing into [2^21, 2^22) puts the node index in the float's MANTISSA
+        # field, already scaled by 4: the ULP there is 0.25, so
+        # `bits & 0x7FFFFF == 4*(t - 2^21)`. The index is then a bit extract
+        # rather than a convert plus a shift -- `v_bfe_u32` where the direct
+        # form needed `v_cvt_i32_f32` + `v_lshlrev_b32`.
+        #
+        # The cost: the bias must be a multiple of the 0.25 ULP, so the
+        # rounding point jitters by up to +-0.125 node instead of sitting at
+        # 0.5, widening the worst-case node distance from 0.5h to 0.625h. Max
+        # relative error on sigma 3.906e-3 -> 3.998e-3, against bf16's own
+        # 7.812e-3 floor. 711.5 is the best of the three quarters bracketing
+        # the ideal 711.611 (711.25 and 711.75 both measure 5.8e-3).
+        _LUT_MAGIC = float(2**21)
+        _LUT_BIG = _LUT_MAGIC + round(_LUT_BIAS * 4.0) / 4.0
         c_lut_scale = fx.Float32(_LUT_SCALE)
-        c_lut_bias = fx.Float32(_LUT_BIAS)
-        c_lut_hi = fx.Float32(float(_LUT_N - 1))
+        c_lut_big = fx.Float32(_LUT_BIG)
+        c_lut_lo = fx.Float32(_LUT_MAGIC)
+        c_lut_hi = fx.Float32(_LUT_MAGIC + float(_LUT_N - 1))
 
         def lut_sigma(gv):
-            """sigma(g) = 1/(1+2^g) by table lookup. Four full-rate ops and one
-            ds_read, against v_exp_f32 + v_add_f32 + v_rcp_f32."""
-            t = gv * c_lut_scale + c_lut_bias
+            """sigma(g) = 1/(1+2^g) by table lookup. Three full-rate ops and
+            one ds_read, against v_exp_f32 + v_add_f32 + v_rcp_f32."""
+            t = gv * c_lut_scale + c_lut_big
             t = fx.Float32(
                 llvm.call_intrinsic(
                     fx.Float32.ir_type,
                     "llvm.amdgcn.fmed3.f32",
-                    [t.ir_value(), c_zero_f.ir_value(), c_lut_hi.ir_value()],
+                    [t.ir_value(), c_lut_lo.ir_value(), c_lut_hi.ir_value()],
                     [],
                     [],
                 )
             )
-            return Vec(lut_mem[t.to(fx.Int32), None].load())[0]
+            idx = (t.bitcast(fx.Int32) >> fx.Int32(2)) & fx.Int32(0x1FFFFF)
+            return Vec(lut_mem[idx, None].load())[0]
 
         def build_sigma_lut():
             """Fill the table once per workgroup. ~5 rounds over BLOCK_THREADS,
