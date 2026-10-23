@@ -566,7 +566,14 @@ def build_hstu_attention_fwd_pp(
     _LUT_BIAS = -_LUT_GLO / _LUT_H + 0.5   # +0.5 so truncation == round-to-nearest
     _LUT_ROUNDS = (_LUT_N + BLOCK_THREADS - 1) // BLOCK_THREADS
 
-    GATE_BATCH = 4
+    # 32 == the whole tile: every LUT read issues before any of them is
+    # consumed, so the first `s_waitcnt` covers 18 of the 32 multiplies
+    # instead of 1. Non-monotonic -- 16 is WORSE than both 4 and 32 --
+    # and free in registers (244 VGPR either way), because the address
+    # register is reused in place as the loaded sigma.
+    #   4 -> 105.28 ms | 16 -> 106.28 | 32 -> 103.70   (means of 2 runs,
+    #   shipping control stable within 0.6%)
+    GATE_BATCH = 32
     assert GATE_BATCH % MFMA_ELEMS_PER_LANE == 0
 
 
