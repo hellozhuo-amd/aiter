@@ -579,6 +579,21 @@ def build_hstu_attention_fwd_pp(
     # burst, so the remaining MFMAs cover their latency (see mfma_burst).
     INTERLEAVE_STORE = True
     GATE_HALVES = True
+    # Elements in the FIRST group of the gate's software pipeline; the rest
+    # form the second. Swept by `s_waitcnt` count in the unmasked phase V:
+    #
+    #    4+28 -> 183 instr,  5 waits
+    #    8+24 -> 181 instr,  3 waits   <-- best
+    #   12+20 -> 187 instr,  9 waits
+    #   16+16 -> 187 instr,  9 waits
+    #   20+12 -> 192 instr, 14 waits
+    #
+    # A SMALL first group is what works: it needs only a few reads landed to
+    # start, and the 24 reads behind it then drain under the first group's own
+    # multiplies and packs. A large first group spreads its reads over a longer
+    # issue window, so fewer land before its multiplies start and the tail
+    # degenerates into one wait per element.
+    GATE_SPLIT = 8
     GATE_BATCH = 32
     assert GATE_BATCH % MFMA_ELEMS_PER_LANE == 0
 
@@ -1655,7 +1670,7 @@ def build_hstu_attention_fwd_pp(
                 # Note the address math CANNOT move a phase earlier: `g` is
                 # produced by GEMM1 in the M phase immediately before this one,
                 # so there is nothing to compute in V(i-1).
-                _h = len(flat) // 2
+                _h = min(GATE_SPLIT, len(flat) - MFMA_ELEMS_PER_LANE)
                 rocdl.sched_barrier(0)
                 _i0 = [lut_index(x) for x in flat[:_h]]
                 rocdl.sched_barrier(0)
