@@ -1665,8 +1665,31 @@ def build_hstu_attention_fwd_pp(
                 rocdl.sched_barrier(0)
                 _s1 = [lut_load(x) for x in _i1]
                 rocdl.sched_barrier(0)
-                gated = [flat[k] * _s0[k] for k in range_constexpr(_h)]
-                gated += [flat[_h + k] * _s1[k] for k in range_constexpr(len(flat) - _h)]
+                # Consume each half COMPLETELY -- multiply AND pack -- before
+                # touching the other. The second half's 8 `v_perm_b32` then sit
+                # between the first half's reads and the second half's
+                # multiplies, adding another 8 instructions of cover on top of
+                # the address math.
+                _E = MFMA_ELEMS_PER_LANE
+                _pk = []
+                for _half, (_src, _sig, _off) in enumerate(
+                    ((flat[:_h], _s0, 0), (flat[_h:], _s1, _h))
+                ):
+                    rocdl.sched_barrier(0)
+                    _g = [_src[k] * _sig[k] for k in range_constexpr(len(_src))]
+                    rocdl.sched_barrier(0)
+                    _pk += [
+                        pack_p(_g[j * _E : (j + 1) * _E])
+                        for j in range_constexpr(len(_src) // _E)
+                    ]
+                    rocdl.sched_barrier(0)
+                return [
+                    [
+                        _pk[ng * Q_SUBTILES + qg]
+                        for qg in range_constexpr(Q_SUBTILES)
+                    ]
+                    for ng in range_constexpr(KV_SUBTILES)
+                ]
             else:
                 gated = []
                 for b in range_constexpr(0, len(flat), GATE_BATCH):
