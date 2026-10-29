@@ -270,6 +270,14 @@ _FWD_PP_TILES = {
     "waves_per_eu": 2,
 }
 
+# Under a sliding window the KV range of a Q tile is block_m + max_attn_len wide
+# and only max_attn_len of it is in band, so a taller tile computes more masked
+# scores: at max_attn_len=512 (512,32) sweeps 50% wasted work, (256,32) 33%.
+# With the mask folded into GEMM1's bias the phases no longer need the extra
+# length, and at B=1024 H=4 N=16384 d=64 W=512 against the shipping tuned tile
+# (256,32) measures 1.115x, (384,32) 1.086x and (512,32) 0.93x (9 VGPR spills).
+_FWD_PP_TILES_WINDOWED = {**_FWD_PP_TILES, "block_m": 256}
+
 
 def _fwd_pp_requested() -> bool:
     """AITER_HSTU_FWD_PINGPONG, read OUTSIDE the lru_cache.
@@ -299,7 +307,8 @@ def _fwd_pp_launcher(
     if not explicit and not pp_env:
         return None
 
-    config = {**_FWD_PP_TILES, **custom_config}
+    tiles = _FWD_PP_TILES_WINDOWED if kwargs.get("max_attn_len", 0) > 0 else _FWD_PP_TILES
+    config = {**tiles, **custom_config}
     pp_kwargs = {**kwargs, **config}
     try:
         validate_hstu_attention_fwd_pp(**pp_kwargs)

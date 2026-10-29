@@ -574,14 +574,24 @@ def build_hstu_attention_fwd_pp(
     # passes through gives a diagonal one, and there are at most three of them.
     #
     # So the mask is precomputed ONCE per workgroup into a small LDS table of
-    # bias tiles -- 0 where kept, BIAS_HUGE where dropped -- and each phase M
-    # loads the right tile straight into GEMM1's accumulator as its initial
-    # value. A dropped score comes out as g + BIAS_HUGE, which the LUT's
-    # upper clamp sends to an extra entry holding sigma = 0, so p = g*0 = 0.
-    # Phase V then runs exactly the unmasked gate: no compare, no select, no
-    # branch. The per-tile cost is a few SALU ops to pick the slot, one
-    # v_add per q-subtile for the address, and KV_SUBTILES ds_read_b128 per
-    # q-subtile in phase M.
+    # bias tiles -- 0 where kept, BIAS_HUGE where dropped -- and the right tile
+    # is loaded straight into GEMM1's accumulator as its initial value. A
+    # dropped score comes out as g + BIAS_HUGE, which the LUT's upper clamp
+    # sends to an extra entry holding sigma = 0, so p = g*0 = 0. Phase V then
+    # runs exactly the unmasked gate: no compare, no select, no branch.
+    #
+    # A table of whole per-tile masks would not fit (one 32-bit mask per lane
+    # per KV tile is ~70 KB at (512,32), W=512) and computing the mask in the
+    # loop costs at least one VALU per score, ~7% of the kernel by this
+    # kernel's calibration. Translation invariance is what makes the table
+    # small: N_BSLOT * KV_SUBTILES KB, 14 KB at W=512.
+    #
+    # The per-tile cost: phase M(i) computes the slot rows for tile i+1 in
+    # SALU, three ops per MFMA shadow (in place, in front of the burst, they
+    # cost 6%); phase V(i) then reads tile i+1's bias tiles after its gate
+    # (one v_add per q-subtile, KV_SUBTILES ds_read_b128 each) so they land
+    # under the phase barrier (read at the head of phase M, the first QK MFMA
+    # waited ~86 cy on them at (256,32)).
     #
     # Target rows are the one exception -- their window hangs off max_id, not
     # off the row, so it is not a function of d. Their q-blocks read the
@@ -591,8 +601,10 @@ def build_hstu_attention_fwd_pp(
     BIAS_HUGE = float(2.0**40)
     N_BINIT = KV_SUBTILES * Q_SUBTILES if BIAS_MASK else 0
     # The MFMA after which phase M starts dropping the next tile's slot SALU
-    # into the shadows, one small piece per MFMA.
-    BIAS_SIDE_MFMA = int(__import__("os").environ.get("HSTU_PP_SIDE", 2 * Q_SUBTILES))
+    # into the shadows, one small piece per MFMA. At (256,32): starting after
+    # MFMA 2 measured 1.046x, after 4 or 8 1.065x -- the first QK MFMAs wait
+    # on LDS reads and want the shadow to themselves.
+    BIAS_SIDE_MFMA = 2 * Q_SUBTILES
     if BIAS_MASK:
         _W = max_attn_len
         _KS = KV_SUBTILES
