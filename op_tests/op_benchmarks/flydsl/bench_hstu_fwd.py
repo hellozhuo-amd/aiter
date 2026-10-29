@@ -11,7 +11,8 @@ Three providers, all run on the same tensors and the same seeded jagged lengths:
   ``ck``        the CK-tile forward binary (tile_example_hstu_attention_fwd).
 
 Protocol (SILOTIGER-1337): production ``hstu`` mask -- causal with the target
-diagonal, max_attn_len=0, contextual_seq_len=0 -- sparsity 0.95, bf16, N=16384,
+diagonal, max_attn_len=0, contextual_seq_len=0 -- plus a ``windowed`` mask that
+is the same but with max_attn_len=512 (CK: -local_len=512). Sparsity 0.95, bf16, N=16384,
 d_qk=d_v=64, targets 10 for Training and 300 for Inference. One pass is 3
 warmup launches then 11 timed launches. The cell reports the median over
 ``--reps`` passes (default 3), with the passes interleaved across providers so
@@ -31,6 +32,9 @@ Usage (from the repo root, so the ``op_tests`` import resolves):
 
     # Every cell, all three providers
     python -m op_tests.op_benchmarks.flydsl.bench_hstu_fwd
+
+    # Windowed mask (max_attn_len=512) only
+    python -m op_tests.op_benchmarks.flydsl.bench_hstu_fwd --mask windowed
 
     # Inference cells only, FlyDSL arms only
     python -m op_tests.op_benchmarks.flydsl.bench_hstu_fwd --regime Inference --provider pingpong flydsl
@@ -90,8 +94,11 @@ ALPHA = 1.0 / HEAD_DIM * 10000
 WARMUP = 3
 ITERS = 11
 
+# mask name -> max_attn_len (0 = no window).
+MASKS = {"hstu": 0, "windowed": 512}
+
 # (regime, batch, heads, target_size). Regime names are the ticket's; both are
-# forward measurements here.
+# forward measurements here. Every cell runs once per selected mask.
 CELLS = [
     ("Training", 1024, 4, 10),
     ("Training", 1024, 8, 10),
@@ -103,19 +110,6 @@ PROVIDERS = ("pingpong", "flydsl", "ck")
 LABELS = {"pingpong": "FlyDSL ping-pong", "flydsl": "FlyDSL shipping", "ck": "CK"}
 BASELINE = "flydsl"
 CK_TIMING = re.compile(r"execution time .*? is ([0-9.]+) milli-seconds")
-
-DISPLAY_COLS = [
-    "regime",
-    "B",
-    "H",
-    "targets",
-    "provider",
-    "median_ms",
-    "min_ms",
-    "vs shipping",
-    "vs CK",
-]
-
 
 def make_inputs(b, h, target_size):
     """Jagged q/k/v, offsets, targets and lengths. One seed fixes all of them."""
@@ -155,14 +149,14 @@ def time_pass(fn) -> np.ndarray:
     return np.array([s.elapsed_time(e) for s, e in zip(starts, ends)])
 
 
-def run_ck(b, h, lengths, num_targets) -> float:
+def run_ck(b, h, lengths, num_targets, max_attn_len) -> float:
     """One CK process = one pass. Returns its reported mean over the timed launches."""
     uih = (lengths - num_targets.to(lengths.dtype)).tolist()
     cmd = [
         str(CK_BIN), "-prec=bf16", f"-b={b}", f"-nhead={h}",
         "-hdim_qk=64", "-hdim_v=64", "-jagged=1",
         "-v=0", "-perf=1", "-causal=1",
-        "-local_len=0", "-context_len=0", "-minfull_len=0",
+        f"-local_len={max_attn_len}", "-context_len=0", "-minfull_len=0",
         f"-alpha={ALPHA}",
         "-seqlens=" + ",".join(map(str, uih)),
         "-targets=" + ",".join(map(str, num_targets.tolist())),
@@ -181,13 +175,14 @@ def run_ck(b, h, lengths, num_targets) -> float:
     return float(match.group(1))
 
 
-def bench_cell(regime, b, h, target_size, providers, reps, pp_tile):
+def bench_cell(mask, regime, b, h, target_size, providers, reps, pp_tile):
     """Time the selected providers on one cell. Returns one row per provider."""
     q, k, v, offsets, num_targets, lengths = make_inputs(b, h, target_size)
     total = int(offsets[-1].item())
     out = torch.empty_like(v)
     stream = torch.cuda.current_stream(q.device)
-    fwd_args = (SEQ_LEN, ALPHA, q, k, v, offsets, True, num_targets, 0, 0)
+    max_attn_len = MASKS[mask]
+    fwd_args = (SEQ_LEN, ALPHA, q, k, v, offsets, True, num_targets, max_attn_len, 0)
 
     launch = {}
     if "flydsl" in providers:
@@ -196,7 +191,7 @@ def bench_cell(regime, b, h, target_size, providers, reps, pp_tile):
         bm, bn = pp_tile
         pp = build_hstu_attention_fwd_pp(
             num_heads=h, head_dim=HEAD_DIM, hidden_dim=HEAD_DIM, causal=True,
-            max_attn_len=0, contextual_seq_len=0, has_targets=True,
+            max_attn_len=max_attn_len, contextual_seq_len=0, has_targets=True,
             alpha=ALPHA, dtype_str="bf16",
             block_m=bm, block_n=bn, num_waves=8, waves_per_eu=2,
         )  # fmt: skip
@@ -210,7 +205,7 @@ def bench_cell(regime, b, h, target_size, providers, reps, pp_tile):
         order = providers if rep % 2 == 0 else providers[::-1]
         for prov in order:
             if prov == "ck":
-                value = run_ck(b, h, lengths, num_targets)
+                value = run_ck(b, h, lengths, num_targets, max_attn_len)
                 passes[prov].append((value, value))
             else:
                 times = time_pass(launch[prov])
@@ -224,7 +219,7 @@ def bench_cell(regime, b, h, target_size, providers, reps, pp_tile):
     rows = []
     for prov in providers:
         rows.append({
-            "regime": regime, "B": b, "H": h, "targets": target_size,
+            "mask": mask, "regime": regime, "B": b, "H": h, "targets": target_size,
             "provider": LABELS[prov], "L": total,
             "median_ms": medians[prov], "min_ms": mins[prov],
             "vs shipping": base / medians[prov],
@@ -237,18 +232,34 @@ def bench_cell(regime, b, h, target_size, providers, reps, pp_tile):
     return rows
 
 
-def _ratio(value):
-    return "" if value is None or np.isnan(value) else f"{value:.2f}x"
-
-
 def format_table(df):
-    out = df[DISPLAY_COLS].copy()
-    for col in ("median_ms", "min_ms"):
-        out[col] = out[col].map(lambda v: f"{v:.1f}")
-    for col in ("vs shipping", "vs CK"):
-        out[col] = out[col].map(_ratio)
-    # `disable_numparse` keeps tabulate from re-parsing the formatted strings.
-    return out.to_markdown(index=False, disable_numparse=True)
+    """One row per shape, one ms column per provider, like the SILOTIGER-1337 tables.
+
+    Ratios are time ratios (a / b): below 1.00 means the first provider is faster.
+    The fastest provider in each row is bold.
+    """
+    short = {"pingpong": "ping-pong", "flydsl": "shipping", "ck": "CK"}
+    present = [p for p in PROVIDERS if LABELS[p] in set(df["provider"])]
+    ratios = [("pingpong", "flydsl")] if {"pingpong", "flydsl"} <= set(present) else []
+    cols = (
+        ["Shape"]
+        + [f"{short[p]} (ms)" for p in present]
+        + [f"{short[a]} / {short[b]}" for a, b in ratios]
+    )
+    keys = ["mask", "regime", "B", "H", "targets"]
+    out = []
+    for (mask, regime, b, h, _t), g in df.groupby(keys, sort=False):
+        ms = {p: float(g[g["provider"] == LABELS[p]]["median_ms"].iloc[0]) for p in present}
+        best = min(ms.values())
+        kind = "train" if regime == "Training" else "infer"
+        shape = f"{kind} B={b} H={h}" + (f" {mask}" if mask != "hstu" else "")
+        row = [shape]
+        for p in present:
+            cell = f"{ms[p]:.1f}"
+            row.append(f"**{cell}**" if ms[p] == best else cell)
+        row += [f"{ms[a] / ms[bb]:.2f}" for a, bb in ratios]
+        out.append(row)
+    return pd.DataFrame(out, columns=cols).to_markdown(index=False, disable_numparse=True)
 
 
 def parse_args():
@@ -262,6 +273,15 @@ def parse_args():
         "--provider", nargs="*", default=list(PROVIDERS), choices=list(PROVIDERS),
         help="""Providers to time.
         e.g.: --provider pingpong flydsl""",
+    )  # fmt: skip
+    parser.add_argument(
+        "--mask", nargs="*", default=list(MASKS), choices=list(MASKS),
+        help="""Masks to run: hstu (max_attn_len=0) and/or windowed (max_attn_len=512).
+        e.g.: --mask windowed""",
+    )  # fmt: skip
+    parser.add_argument(
+        "--no-ck", action="store_true",
+        help="""Skip the CK provider (same as leaving ck out of --provider).""",
     )  # fmt: skip
     parser.add_argument(
         "--regime", nargs="*", default=["Training", "Inference"],
@@ -292,7 +312,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    providers = [p for p in PROVIDERS if p in args.provider]
+    providers = [
+        p for p in PROVIDERS if p in args.provider and not (args.no_ck and p == "ck")
+    ]
 
     if "ck" in providers:
         if not CK_BIN.exists():
@@ -310,13 +332,21 @@ def main():
     os.environ.pop("AITER_HSTU_FWD_PINGPONG", None)
     pp_tile = tuple(int(x) for x in args.pp_tile.split(","))
 
-    cells = [c for c in CELLS if c[0] in args.regime and c[2] in args.heads]
+    cells = [
+        (m, *c)
+        for m in MASKS
+        if m in args.mask
+        for c in CELLS
+        if c[0] in args.regime and c[2] in args.heads
+    ]
     rows = []
-    for index, (regime, b, h, target_size) in enumerate(cells, 1):
-        tag = f"{regime} B={b} H={h} targets={target_size}"
+    for index, (mask, regime, b, h, target_size) in enumerate(cells, 1):
+        tag = f"{mask} {regime} B={b} H={h} targets={target_size}"
         # Printed before the cell runs so a long compile is not silent.
         print(f"[{index}/{len(cells)}] {tag} ... ", end="", flush=True)
-        cell_rows = bench_cell(regime, b, h, target_size, providers, args.reps, pp_tile)
+        cell_rows = bench_cell(
+            mask, regime, b, h, target_size, providers, args.reps, pp_tile
+        )
         rows += cell_rows
         print(
             "  ".join(f"{r['provider']} {r['median_ms']:.1f}" for r in cell_rows),
