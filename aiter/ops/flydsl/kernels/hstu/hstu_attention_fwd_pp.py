@@ -573,7 +573,6 @@ def build_hstu_attention_fwd_pp(
     # register is reused in place as the loaded sigma.
     #   4 -> 105.28 ms | 16 -> 106.28 | 32 -> 103.70   (means of 2 runs,
     #   shipping control stable within 0.6%)
-    SPECIALISE_DUTY = True
     # Issue the staging ds_writes AHEAD of the MFMA burst (see mfma_phase).
     # Issue the staging stores STORE_LEAD units before the end of the MFMA
     # burst, so the remaining MFMAs cover their latency (see mfma_burst).
@@ -1745,7 +1744,7 @@ def build_hstu_attention_fwd_pp(
         # ==== The two phases ====
         N_PACK = KV_SUBTILES * Q_SUBTILES
 
-        def mfma_phase(o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, g0=None):
+        def mfma_phase(o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, g0):
             """PHASE M: both GEMMs, their LDS operand feed, and this group's staging.
 
             Returns (o_acc, s_accs, kv_regs_next). `u` is the sub-trip position,
@@ -1797,9 +1796,7 @@ def build_hstu_attention_fwd_pp(
             def _store_v(k):
                 store_v_regs_to_lds(kv_regs, v_smem[v_cur], part=k)
 
-            if const_expr(g0 is None):
-                _ts = None          # unspecialised: keep the old whole-block form
-            elif const_expr(g0):
+            if const_expr(g0):
                 _ts = (_N_STORE_K, _store_k)
             else:
                 _ts = (_N_STORE_V, _store_v)
@@ -1808,14 +1805,9 @@ def build_hstu_attention_fwd_pp(
                 o_acc, p_prev, pre, k_smem[k_cur], v_smem[v_prev],
                 tail_store=_ts if const_expr(INTERLEAVE_STORE) else None,
             )
-            if const_expr(not INTERLEAVE_STORE or g0 is None):
+            if const_expr(not INTERLEAVE_STORE):
                 rocdl.s_waitcnt(vmcnt=0)
-                if const_expr(g0 is None):
-                    if is_g0:
-                        store_k_regs_to_lds(kv_regs, k_smem[k_fill])
-                    else:
-                        store_v_regs_to_lds(kv_regs, v_smem[v_cur])
-                elif const_expr(g0):
+                if const_expr(g0):
                     store_k_regs_to_lds(kv_regs, k_smem[k_fill])
                 else:
                     store_v_regs_to_lds(kv_regs, v_smem[v_cur])
@@ -2022,190 +2014,7 @@ def build_hstu_attention_fwd_pp(
             #
             # Barrier counts are identical in both arms -- they differ only in
             # which LDS tensor they store -- so the ping-pong skew is intact.
-            if const_expr(SPECIALISE_DUTY):
-                if is_g0:
-                    loop_results = carry_init
-                    # ---- Unmasked prefix (empty unless CAUSAL_SPLIT) ----
-                    for _o0, it in range(
-                        fx.Int32(0),
-                        n_unmasked // fx.Int32(UNROLL),
-                        fx.Int32(1),
-                        init=carry_init,
-                    ):  # ty: ignore
-                        o_acc, p_prev, kv_regs, st_o, pre = split_carry(it)
-                        base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
-                        for u in range_constexpr(UNROLL):
-                            # Loop rotated: the closing barrier of each gate phase is
-                            # issued at the TOP of the next sub-trip rather than the
-                            # bottom of this one, so the scf.for back edge -- increment,
-                            # trip compare, branch -- lands in the tail of the gate phase
-                            # instead of at the head of the MFMA phase, where it would
-                            # sit in front of the burst.
-                            if const_expr(u == 0):
-                                phase_barrier()
-                            kv_tile = base + fx.Int32(u)
-                            o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
-                                o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True
-                            )
-                            phase_barrier()
-                            p_flat = gate_phase(
-                                kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False
-                            )
-                            p_prev = unflatten(p_flat)
-                            if const_expr(u < UNROLL - 1):
-                                phase_barrier()
-                        loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre)
-
-                    # ---- Masked remainder + drain ----
-                    for _o1, it in range(
-                        fx.Int32(0),
-                        n_masked // fx.Int32(UNROLL),
-                        fx.Int32(1),
-                        init=loop_results,
-                    ):  # ty: ignore
-                        o_acc, p_prev, kv_regs, st_o, pre = split_carry(it)
-                        base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
-                        for u in range_constexpr(UNROLL):
-                            # Loop rotated: the closing barrier of each gate phase is
-                            # issued at the TOP of the next sub-trip rather than the
-                            # bottom of this one, so the scf.for back edge -- increment,
-                            # trip compare, branch -- lands in the tail of the gate phase
-                            # instead of at the head of the MFMA phase, where it would
-                            # sit in front of the burst.
-                            if const_expr(u == 0):
-                                phase_barrier()
-                            kv_tile = base + fx.Int32(u)
-                            o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
-                                o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True
-                            )
-                            phase_barrier()
-                            p_flat = gate_phase(
-                                kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True
-                            )
-                            p_prev = unflatten(p_flat)
-                            if const_expr(u < UNROLL - 1):
-                                phase_barrier()
-                        loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre)
-
-                    # Closes the last sub-trip's gate phase, which the rotation left
-                    # without a trailing barrier inside the loop.
-                    phase_barrier()
-
-                    # g1 repays the skew barrier so both groups leave with equal counts.
-                    if not is_g0:
-                        phase_barrier()
-
-                    # ---- Epilogue: store O (1/N hoisted here) ----
-                    # GEMM2 writes a transposed C fragment: A=P, B=V, C[d, query].
-                    # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
-                    # therefore q_blk_base(qg) + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
-                    results = (
-                        list(loop_results)
-                        if isinstance(loop_results, (list, tuple))
-                        else [loop_results]
-                    )
-                    for qg in range_constexpr(Q_SUBTILES):
-                        q_row_base = q_blk_base(qg) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                        for e in range_constexpr(MFMA_ELEMS_PER_LANE):
-                            q_row_e = q_row_base + fx.Int32(e)
-                            if q_row_e < seq_len:
-                                for c in range_constexpr(D_CHUNKS):
-                                    ov = results[c * Q_SUBTILES + qg]
-                                    d_col = fx.Int32(c * MFMA_M) + lane_mod_16
-                                    val = (Vec(ov)[e] * inv_n).to(elem_dtype)
-                                    out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
-                else:
-                    loop_results = carry_init
-                    # ---- Unmasked prefix (empty unless CAUSAL_SPLIT) ----
-                    for _o0, it in range(
-                        fx.Int32(0),
-                        n_unmasked // fx.Int32(UNROLL),
-                        fx.Int32(1),
-                        init=carry_init,
-                    ):  # ty: ignore
-                        o_acc, p_prev, kv_regs, st_o, pre = split_carry(it)
-                        base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
-                        for u in range_constexpr(UNROLL):
-                            # Loop rotated: the closing barrier of each gate phase is
-                            # issued at the TOP of the next sub-trip rather than the
-                            # bottom of this one, so the scf.for back edge -- increment,
-                            # trip compare, branch -- lands in the tail of the gate phase
-                            # instead of at the head of the MFMA phase, where it would
-                            # sit in front of the burst.
-                            if const_expr(u == 0):
-                                phase_barrier()
-                            kv_tile = base + fx.Int32(u)
-                            o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
-                                o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False
-                            )
-                            phase_barrier()
-                            p_flat = gate_phase(
-                                kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False
-                            )
-                            p_prev = unflatten(p_flat)
-                            if const_expr(u < UNROLL - 1):
-                                phase_barrier()
-                        loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre)
-
-                    # ---- Masked remainder + drain ----
-                    for _o1, it in range(
-                        fx.Int32(0),
-                        n_masked // fx.Int32(UNROLL),
-                        fx.Int32(1),
-                        init=loop_results,
-                    ):  # ty: ignore
-                        o_acc, p_prev, kv_regs, st_o, pre = split_carry(it)
-                        base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
-                        for u in range_constexpr(UNROLL):
-                            # Loop rotated: the closing barrier of each gate phase is
-                            # issued at the TOP of the next sub-trip rather than the
-                            # bottom of this one, so the scf.for back edge -- increment,
-                            # trip compare, branch -- lands in the tail of the gate phase
-                            # instead of at the head of the MFMA phase, where it would
-                            # sit in front of the burst.
-                            if const_expr(u == 0):
-                                phase_barrier()
-                            kv_tile = base + fx.Int32(u)
-                            o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
-                                o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False
-                            )
-                            phase_barrier()
-                            p_flat = gate_phase(
-                                kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True
-                            )
-                            p_prev = unflatten(p_flat)
-                            if const_expr(u < UNROLL - 1):
-                                phase_barrier()
-                        loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre)
-
-                    # Closes the last sub-trip's gate phase, which the rotation left
-                    # without a trailing barrier inside the loop.
-                    phase_barrier()
-
-                    # g1 repays the skew barrier so both groups leave with equal counts.
-                    if not is_g0:
-                        phase_barrier()
-
-                    # ---- Epilogue: store O (1/N hoisted here) ----
-                    # GEMM2 writes a transposed C fragment: A=P, B=V, C[d, query].
-                    # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
-                    # therefore q_blk_base(qg) + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
-                    results = (
-                        list(loop_results)
-                        if isinstance(loop_results, (list, tuple))
-                        else [loop_results]
-                    )
-                    for qg in range_constexpr(Q_SUBTILES):
-                        q_row_base = q_blk_base(qg) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                        for e in range_constexpr(MFMA_ELEMS_PER_LANE):
-                            q_row_e = q_row_base + fx.Int32(e)
-                            if q_row_e < seq_len:
-                                for c in range_constexpr(D_CHUNKS):
-                                    ov = results[c * Q_SUBTILES + qg]
-                                    d_col = fx.Int32(c * MFMA_M) + lane_mod_16
-                                    val = (Vec(ov)[e] * inv_n).to(elem_dtype)
-                                    out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
-            else:
+            if is_g0:
                 loop_results = carry_init
                 # ---- Unmasked prefix (empty unless CAUSAL_SPLIT) ----
                 for _o0, it in range(
@@ -2227,7 +2036,7 @@ def build_hstu_attention_fwd_pp(
                             phase_barrier()
                         kv_tile = base + fx.Int32(u)
                         o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u
+                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True
                         )
                         phase_barrier()
                         p_flat = gate_phase(
@@ -2258,7 +2067,98 @@ def build_hstu_attention_fwd_pp(
                             phase_barrier()
                         kv_tile = base + fx.Int32(u)
                         o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u
+                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True
+                        )
+                        phase_barrier()
+                        p_flat = gate_phase(
+                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True
+                        )
+                        p_prev = unflatten(p_flat)
+                        if const_expr(u < UNROLL - 1):
+                            phase_barrier()
+                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre)
+
+                # Closes the last sub-trip's gate phase, which the rotation left
+                # without a trailing barrier inside the loop.
+                phase_barrier()
+
+                # g1 repays the skew barrier so both groups leave with equal counts.
+                if not is_g0:
+                    phase_barrier()
+
+                # ---- Epilogue: store O (1/N hoisted here) ----
+                # GEMM2 writes a transposed C fragment: A=P, B=V, C[d, query].
+                # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
+                # therefore q_blk_base(qg) + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
+                results = (
+                    list(loop_results)
+                    if isinstance(loop_results, (list, tuple))
+                    else [loop_results]
+                )
+                for qg in range_constexpr(Q_SUBTILES):
+                    q_row_base = q_blk_base(qg) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                    for e in range_constexpr(MFMA_ELEMS_PER_LANE):
+                        q_row_e = q_row_base + fx.Int32(e)
+                        if q_row_e < seq_len:
+                            for c in range_constexpr(D_CHUNKS):
+                                ov = results[c * Q_SUBTILES + qg]
+                                d_col = fx.Int32(c * MFMA_M) + lane_mod_16
+                                val = (Vec(ov)[e] * inv_n).to(elem_dtype)
+                                out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
+            else:
+                loop_results = carry_init
+                # ---- Unmasked prefix (empty unless CAUSAL_SPLIT) ----
+                for _o0, it in range(
+                    fx.Int32(0),
+                    n_unmasked // fx.Int32(UNROLL),
+                    fx.Int32(1),
+                    init=carry_init,
+                ):  # ty: ignore
+                    o_acc, p_prev, kv_regs, st_o, pre = split_carry(it)
+                    base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
+                    for u in range_constexpr(UNROLL):
+                        # Loop rotated: the closing barrier of each gate phase is
+                        # issued at the TOP of the next sub-trip rather than the
+                        # bottom of this one, so the scf.for back edge -- increment,
+                        # trip compare, branch -- lands in the tail of the gate phase
+                        # instead of at the head of the MFMA phase, where it would
+                        # sit in front of the burst.
+                        if const_expr(u == 0):
+                            phase_barrier()
+                        kv_tile = base + fx.Int32(u)
+                        o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
+                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False
+                        )
+                        phase_barrier()
+                        p_flat = gate_phase(
+                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False
+                        )
+                        p_prev = unflatten(p_flat)
+                        if const_expr(u < UNROLL - 1):
+                            phase_barrier()
+                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre)
+
+                # ---- Masked remainder + drain ----
+                for _o1, it in range(
+                    fx.Int32(0),
+                    n_masked // fx.Int32(UNROLL),
+                    fx.Int32(1),
+                    init=loop_results,
+                ):  # ty: ignore
+                    o_acc, p_prev, kv_regs, st_o, pre = split_carry(it)
+                    base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
+                    for u in range_constexpr(UNROLL):
+                        # Loop rotated: the closing barrier of each gate phase is
+                        # issued at the TOP of the next sub-trip rather than the
+                        # bottom of this one, so the scf.for back edge -- increment,
+                        # trip compare, branch -- lands in the tail of the gate phase
+                        # instead of at the head of the MFMA phase, where it would
+                        # sit in front of the burst.
+                        if const_expr(u == 0):
+                            phase_barrier()
+                        kv_tile = base + fx.Int32(u)
+                        o_acc, s_accs, kv_regs, st_o, pre = mfma_phase(
+                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False
                         )
                         phase_barrier()
                         p_flat = gate_phase(
