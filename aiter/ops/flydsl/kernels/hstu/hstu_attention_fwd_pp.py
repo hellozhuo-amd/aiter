@@ -1109,6 +1109,22 @@ def build_hstu_attention_fwd_pp(
                 _b = (q_row_ids[qg] > fx.Int32(0)).select(_b, _id_ceiling)
             q_border.append(_b)
 
+        # A window adds one more per-row bound, on the LOW side: a row keeps
+        # col_id >= q_id - max_attn_len. With no contextual prefix to_id is the
+        # identity below max_id and max_id above it, so the same bound holds in
+        # RAW columns -- col >= min(q, max_id) - W -- and the windowed mask is
+        # the causal border plus ONE compare, not a per-column to_id.
+        BORDER_MASK = causal and not has_contextual
+
+        def _win_lo(r):
+            if const_expr(has_targets):
+                r = (r < _id_ceiling).select(r, _id_ceiling)
+            return r - fx.Int32(max_attn_len)
+
+        q_lo = []
+        if const_expr(has_window and BORDER_MASK):
+            q_lo = [_win_lo(q_rows_i32[qg]) for qg in range_constexpr(Q_SUBTILES)]
+
         # ---- Wave-uniform bounds, for the per-sub-block diagonal test -------
         # A 16x16 (qg, ng) sub-block is entirely below the diagonal, entirely
         # above it, or straddling it, and which one is decided by numbers that
@@ -1128,7 +1144,7 @@ def build_hstu_attention_fwd_pp(
         # The border is monotone non-decreasing in the row only when there is
         # no contextual prefix (whose rows all carry the ceiling), which is the
         # same condition the unmasked/masked split already requires.
-        SUBBLK_SKIP = causal and not has_window and not has_contextual
+        SUBBLK_SKIP = causal and not has_contextual
         if const_expr(SUBBLK_SKIP):
             def _row_border(r):
                 b = r + fx.Int32(1)
@@ -1138,6 +1154,9 @@ def build_hstu_attention_fwd_pp(
 
             q_blk_blo = [_row_border(x) for x in q_blk_lo]
             q_blk_bhi = [_row_border(x) for x in q_blk_hi]
+            if const_expr(has_window):
+                q_blk_wlo = [_win_lo(x) for x in q_blk_lo]
+                q_blk_whi = [_win_lo(x) for x in q_blk_hi]
 
         # ---- KV range: causal upper bound + active predicate ----
         q_start = q_tile_idx * fx.Int32(BLOCK_M)
@@ -1477,6 +1496,17 @@ def build_hstu_attention_fwd_pp(
 
         c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
+        def border_keep(col, qg):
+            """Keep predicate of raw column `col` for q-subtile `qg`, border form."""
+            keep = col < q_border[qg]
+            if const_expr(has_window):
+                keep = keep & (col >= q_lo[qg])
+            if const_expr(has_targets):
+                # A target row's id is clamped, so its border stops at the
+                # ceiling and the diagonal has to come back by hand.
+                keep = keep | (col == q_rows_i32[qg])
+            return keep
+
         def gate_tile_split(kv_start, s_accs):
             """PHASE V for a tile that STRADDLES the causal diagonal.
 
@@ -1523,6 +1553,13 @@ def build_hstu_attention_fwd_pp(
                     # Below it: every column is inside the sequence and under
                     # the LOWEST row's border (the border is monotone here).
                     all_keep = (kv_hi < q_blk_blo[qg]) & (kv_hi < seq_len)
+                    if const_expr(has_window):
+                        # Below the window: every column is under the LOWEST
+                        # row's lower bound, hence under every row's.
+                        all_drop = all_drop | (kv_hi < q_blk_wlo[qg])
+                        # Inside it: every column is at or above the HIGHEST
+                        # row's lower bound, hence above every row's.
+                        all_keep = all_keep & (kv_lo >= q_blk_whi[qg])
                     # Pre-bound: FlyDSL yields the names an `if` ASSIGNS, and
                     # it passes their current values in as the else-of-last-
                     # resort, so they have to exist before the branch.
@@ -1533,12 +1570,7 @@ def build_hstu_attention_fwd_pp(
                         pk = pack_p(silu_scale_batch(s_vals))
                     else:
                         kept = [
-                            (
-                                (col_raw[i] < q_border[qg])
-                                | (col_raw[i] == q_rows_i32[qg])
-                                if const_expr(has_targets)
-                                else col_raw[i] < q_border[qg]
-                            ).select(s_vals[i], c_zero_f)
+                            border_keep(col_raw[i], qg).select(s_vals[i], c_zero_f)
                             for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                         ]
                         pk = pack_p(silu_scale_batch(kept))
@@ -1586,7 +1618,7 @@ def build_hstu_attention_fwd_pp(
                         col_raw[i] < seq_len
                         for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
-                    if const_expr(causal and not has_window):
+                    if const_expr(BORDER_MASK):
                         # The border test is in RAW column positions, so the
                         # out-of-seq fold is one select and `to_id` never runs
                         # per column at all.
@@ -1613,18 +1645,8 @@ def build_hstu_attention_fwd_pp(
                         # bound at definition time -- B023's late-binding concern doesn't apply.
                         def keep_col(i):
                             """causal * window * contextual * target mask for (qg, col i)."""
-                            if const_expr(causal and not has_window):
-                                keep = col_raw[i] < q_border[qg]  # noqa: B023
-                                if const_expr(has_targets):
-                                    # A target row's id is clamped, so its
-                                    # border stops at the ceiling and the
-                                    # diagonal has to come back by hand. Rows
-                                    # below the ceiling already have it folded
-                                    # into the `+1`, where this is redundant.
-                                    keep = keep | (
-                                        col_raw[i] == q_rows_i32[qg]  # noqa: B023
-                                    )
-                                return keep
+                            if const_expr(BORDER_MASK):
+                                return border_keep(col_raw[i], qg)  # noqa: B023
                             dist = q_row_ids[qg] - col_id[i]  # noqa: B023
                             if not causal:
                                 # Non-causal: symmetric id distance |q - col|. With the diagonal
