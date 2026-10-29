@@ -589,7 +589,7 @@ def build_hstu_attention_fwd_pp(
     # a loop-invariant wave predicate.
     BIAS_MASK = has_window and causal and not has_contextual and USE_SIGMA_LUT
     BIAS_HUGE = float(2.0**40)
-    N_BROWS = Q_SUBTILES if BIAS_MASK else 0
+    N_BINIT = KV_SUBTILES * Q_SUBTILES if BIAS_MASK else 0
     # The MFMA after which phase M starts dropping the next tile's slot SALU
     # into the shadows, one small piece per MFMA.
     BIAS_SIDE_MFMA = int(__import__("os").environ.get("HSTU_PP_SIDE", 2 * Q_SUBTILES))
@@ -1654,7 +1654,7 @@ def build_hstu_attention_fwd_pp(
             transcendental on the other.
             """
             if const_expr(bias is not None):
-                s_accs = bias_init(bias)
+                s_accs = bias
             else:
                 s_accs = [
                     [
@@ -2051,7 +2051,7 @@ def build_hstu_attention_fwd_pp(
         N_PACK = KV_SUBTILES * Q_SUBTILES
 
         def mfma_phase(
-            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, g0, masked=False, brows=()
+            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, g0, masked=False, binit=()
         ):
             """PHASE M: both GEMMs, their LDS operand feed, and this group's staging.
 
@@ -2109,14 +2109,16 @@ def build_hstu_attention_fwd_pp(
             else:
                 _ts = (_N_STORE_V, _store_v)
 
-            # BIAS_MASK: this tile's slot rows arrive carried from the previous
-            # phase M, which computed them in its MFMA shadow; this one does the
-            # same for the next tile. Computed in place, the ~14 SALU per
-            # q-subtile sat in front of the first MFMA and cost 6%.
+            # BIAS_MASK: this tile's bias tiles arrive in registers, read at the
+            # end of the previous phase V; this phase computes the NEXT tile's
+            # slot rows in its MFMA shadow, for this group's phase V to read.
+            # Computed in place, the ~14 SALU per q-subtile sat in front of the
+            # first MFMA and cost 6%; read here, the first QK MFMA waited ~86
+            # cy on the table at (256,32).
             _bias = None
             _side = None
             if const_expr(masked and BIAS_MASK):
-                _bias = list(brows)
+                _bias = unflatten(list(binit))
                 _pcs, _pst = bias_row_pieces(
                     lambda: (kv_tile + fx.Int32(1)) * fx.Int32(BLOCK_N)
                 )
@@ -2127,8 +2129,6 @@ def build_hstu_attention_fwd_pp(
                 bias=_bias,
                 side=_side,
             )
-            if const_expr(brows_next is None):
-                brows_next = list(brows)
             if const_expr(not INTERLEAVE_STORE):
                 rocdl.s_waitcnt(vmcnt=0)
                 if const_expr(g0):
@@ -2168,7 +2168,7 @@ def build_hstu_attention_fwd_pp(
             rocdl.s_setprio(0)
             return o_acc, s_accs, kv_regs_next, st_o, pre_next, brows_next
 
-        def gate_phase(kv_start, s_accs, apply_mask=True):
+        def gate_phase(kv_start, s_accs, apply_mask=True, brows=None, binit=()):
             """PHASE V: the mask and the SiLU gate. No memory operation of its own.
 
             The LDS drain does NOT live here, though it looks like it should:
@@ -2182,7 +2182,16 @@ def build_hstu_attention_fwd_pp(
                     s_accs = mask_target_blocks(kv_start, s_accs)
                 apply_mask = False
             p = gate_tile(kv_start, s_accs, apply_mask=apply_mask)
-            return [p[ng][qg] for ng in range_constexpr(KV_SUBTILES) for qg in range_constexpr(Q_SUBTILES)]  # fmt: skip
+            if const_expr(brows is not None):
+                # The next tile's GEMM1 initial accumulators. s_accs is dead
+                # by now, and the reads land under the phase barrier.
+                bi = bias_init(brows)
+                binit = [
+                    bi[ng][qg]
+                    for ng in range_constexpr(KV_SUBTILES)
+                    for qg in range_constexpr(Q_SUBTILES)
+                ]
+            return [p[ng][qg] for ng in range_constexpr(KV_SUBTILES) for qg in range_constexpr(Q_SUBTILES)], list(binit)  # fmt: skip
 
         def unflatten(flat):
             return [
@@ -2214,7 +2223,7 @@ def build_hstu_attention_fwd_pp(
                 [it_list[o + i] for i in range_constexpr(NUM_BATCHES_KV)],
                 [it_list[a + i] for i in range_constexpr(NUM_BATCHES_KV)],
                 [it_list[pre + i] for i in range_constexpr(XPHASE_DEPTH)],
-                [it_list[pre + XPHASE_DEPTH + i] for i in range_constexpr(N_BROWS)],
+                [it_list[pre + XPHASE_DEPTH + i] for i in range_constexpr(N_BINIT)],
             )
 
         if active:
@@ -2313,16 +2322,21 @@ def build_hstu_attention_fwd_pp(
             pre_init = [c_zero_pack for _ in range_constexpr(XPHASE_DEPTH)]
             # The masked loop's first tile is unmasked_end (the unmasked prefix is
             # empty whenever BIAS_MASK is on).
-            brows_init = []
+            binit_init = []
             if const_expr(BIAS_MASK):
-                brows_init = bias_rows(unmasked_end * fx.Int32(BLOCK_N))
+                _bi = bias_init(bias_rows(unmasked_end * fx.Int32(BLOCK_N)))
+                binit_init = [
+                    _bi[ng][qg]
+                    for ng in range_constexpr(KV_SUBTILES)
+                    for qg in range_constexpr(Q_SUBTILES)
+                ]
             carry_init = (
                 acc_init
                 + [c_zero_pack for _ in range_constexpr(N_PACK)]
                 + carry_regs
                 + carry_o
                 + pre_init
-                + brows_init
+                + binit_init
             )
 
             # Trip counts. Both MUST be multiples of UNROLL: slot parity is keyed
@@ -2362,7 +2376,7 @@ def build_hstu_attention_fwd_pp(
                     fx.Int32(1),
                     init=carry_init,
                 ):  # ty: ignore
-                    o_acc, p_prev, kv_regs, st_o, pre, brows = split_carry(it)
+                    o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
                     base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
                     for u in range_constexpr(UNROLL):
                         # Loop rotated: the closing barrier of each gate phase is
@@ -2375,16 +2389,17 @@ def build_hstu_attention_fwd_pp(
                             phase_barrier()
                         kv_tile = base + fx.Int32(u)
                         o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True, brows=brows,
+                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True, binit=binit,
                         )
                         phase_barrier()
-                        p_flat = gate_phase(
-                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False
+                        p_flat, binit = gate_phase(
+                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False,
+                            brows=brows, binit=binit,
                         )
                         p_prev = unflatten(p_flat)
                         if const_expr(u < UNROLL - 1):
                             phase_barrier()
-                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + brows)
+                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
 
                 # ---- Masked remainder + drain ----
                 for _o1, it in range(
@@ -2393,7 +2408,7 @@ def build_hstu_attention_fwd_pp(
                     fx.Int32(1),
                     init=loop_results,
                 ):  # ty: ignore
-                    o_acc, p_prev, kv_regs, st_o, pre, brows = split_carry(it)
+                    o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
                     base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
                     for u in range_constexpr(UNROLL):
                         # Loop rotated: the closing barrier of each gate phase is
@@ -2406,16 +2421,17 @@ def build_hstu_attention_fwd_pp(
                             phase_barrier()
                         kv_tile = base + fx.Int32(u)
                         o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True, masked=True, brows=brows,
+                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True, masked=True, binit=binit,
                         )
                         phase_barrier()
-                        p_flat = gate_phase(
-                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True
+                        p_flat, binit = gate_phase(
+                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True,
+                            brows=brows, binit=binit,
                         )
                         p_prev = unflatten(p_flat)
                         if const_expr(u < UNROLL - 1):
                             phase_barrier()
-                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + brows)
+                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
 
                 # Closes the last sub-trip's gate phase, which the rotation left
                 # without a trailing barrier inside the loop.
@@ -2453,7 +2469,7 @@ def build_hstu_attention_fwd_pp(
                     fx.Int32(1),
                     init=carry_init,
                 ):  # ty: ignore
-                    o_acc, p_prev, kv_regs, st_o, pre, brows = split_carry(it)
+                    o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
                     base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
                     for u in range_constexpr(UNROLL):
                         # Loop rotated: the closing barrier of each gate phase is
@@ -2466,16 +2482,17 @@ def build_hstu_attention_fwd_pp(
                             phase_barrier()
                         kv_tile = base + fx.Int32(u)
                         o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False, brows=brows,
+                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False, binit=binit,
                         )
                         phase_barrier()
-                        p_flat = gate_phase(
-                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False
+                        p_flat, binit = gate_phase(
+                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False,
+                            brows=brows, binit=binit,
                         )
                         p_prev = unflatten(p_flat)
                         if const_expr(u < UNROLL - 1):
                             phase_barrier()
-                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + brows)
+                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
 
                 # ---- Masked remainder + drain ----
                 for _o1, it in range(
@@ -2484,7 +2501,7 @@ def build_hstu_attention_fwd_pp(
                     fx.Int32(1),
                     init=loop_results,
                 ):  # ty: ignore
-                    o_acc, p_prev, kv_regs, st_o, pre, brows = split_carry(it)
+                    o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
                     base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
                     for u in range_constexpr(UNROLL):
                         # Loop rotated: the closing barrier of each gate phase is
@@ -2497,16 +2514,17 @@ def build_hstu_attention_fwd_pp(
                             phase_barrier()
                         kv_tile = base + fx.Int32(u)
                         o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False, masked=True, brows=brows,
+                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False, masked=True, binit=binit,
                         )
                         phase_barrier()
-                        p_flat = gate_phase(
-                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True
+                        p_flat, binit = gate_phase(
+                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True,
+                            brows=brows, binit=binit,
                         )
                         p_prev = unflatten(p_flat)
                         if const_expr(u < UNROLL - 1):
                             phase_barrier()
-                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + brows)
+                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
 
                 # Closes the last sub-trip's gate phase, which the rotation left
                 # without a trailing barrier inside the loop.
