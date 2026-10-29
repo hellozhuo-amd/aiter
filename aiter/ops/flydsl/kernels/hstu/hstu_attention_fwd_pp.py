@@ -2264,7 +2264,20 @@ def build_hstu_attention_fwd_pp(
             first = kv_tile_start
             _t_first = fx.Int32(first) * fx.Int32(BLOCK_N)
             _boot = async_load_kv_regs(stage_seed(fx.Int32(first) - kv_stage_bump))
-            rocdl.s_waitcnt(vmcnt=0)
+            # M(first) ds_writes the tile `kv_stage_start(first)` names, so prime
+            # the carried staging set with exactly that. Issued right behind the
+            # bootstrap load, and the tables are built under both: at one WG per
+            # CU nothing else hides the prologue, which with a window is ~19% of
+            # the workgroup's time at (256,32) -- the loop is only ~24 tiles.
+            carry_o = stage_seed(fx.Int32(first))
+            carry_regs = async_load_kv_regs(carry_o)
+            if const_expr(USE_SIGMA_LUT):
+                build_sigma_lut()
+            if const_expr(BIAS_MASK):
+                build_bias_table()
+            # Only the bootstrap half: the carried set is first consumed by
+            # M(first)'s staging stores, which wait for it themselves.
+            rocdl.s_waitcnt(vmcnt=NUM_BATCHES_KV)
             if is_g0:
                 # Nothing inside the loop writes K(first) -- M(i) writes K(i+1).
                 store_k_regs_to_lds(_boot, k_smem[0])
@@ -2288,10 +2301,6 @@ def build_hstu_attention_fwd_pp(
                     ],
                     v_smem[1],
                 )
-            # M(first) ds_writes the tile `kv_stage_start(first)` names, so prime
-            # the carried staging set with exactly that.
-            carry_o = stage_seed(fx.Int32(first))
-            carry_regs = async_load_kv_regs(carry_o)
 
             # The skew: g0 burns one extra barrier so that from here on g0 is in
             # phase M exactly when g1 is in phase V, and vice versa. Barrier
@@ -2306,13 +2315,8 @@ def build_hstu_attention_fwd_pp(
             # intervening publish. The backward shipped exactly that inversion
             # and it was nondeterministic at every geometry but its tuned one --
             # 0/63 runs there against 36/63 at another (fixed in e2a81264d).
-            if const_expr(USE_SIGMA_LUT):
-                build_sigma_lut()
-            if const_expr(BIAS_MASK):
-                build_bias_table()
             if is_g0:
                 phase_barrier()
-            rocdl.s_waitcnt(vmcnt=0)
             rocdl.s_waitcnt(lgkmcnt=0)
             phase_barrier()
 
