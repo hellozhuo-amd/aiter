@@ -807,7 +807,24 @@ def build_hstu_attention_fwd_pp(
 
             return load
 
-        q_load = grouped_loader(q, head_dim, MFMA_DIM_LANE_K)
+        # ---- The contraction order of GEMM1 --------------------------------
+        # The head dim can be fed to the MFMA k-steps in any order, as long as
+        # Q and K agree. The natural order (step ks, lane group g -> columns
+        # 16*ks + 4*g) gives every lane four separate 8-byte pieces of its Q
+        # row. Pairing the steps instead (step 2p+h -> 32*p + 8*g + 4*h) gives
+        # it two 16-byte pieces, so the Q tile comes in as half as many
+        # instructions touching half as many cache lines; at one WG per CU that
+        # load is on the prologue's critical path. K's LDS read just follows
+        # the same map. (Not bitwise against the natural order: fp32 sums the
+        # k-steps in a different order.)
+        assert MFMA_DIM_K == 16 and MFMA_DIM_LANE_K == 4 and K_STEPS % 2 == 0
+        Q_VEC = 2 * MFMA_DIM_LANE_K
+
+        def qk_col_grp(ks):
+            """Column group (MFMA_DIM_LANE_K units) a lane feeds at k-step `ks`."""
+            return fx.Int32((ks // 2) * 8 + ks % 2) + lane_div_16 * fx.Int32(2)
+
+        q_load = grouped_loader(q, head_dim, Q_VEC)
 
         # ---- The group-selected K/V loader ----
         # g0 reads K, g1 reads V, through ONE unbranched load whose base pointer
@@ -942,15 +959,26 @@ def build_hstu_attention_fwd_pp(
             issued as early as the sequence bounds allow. Out-of-sequence rows
             read row 0 and are zeroed at the consumer: a select on a loaded
             value would pin the wait to the issuing point."""
-            raws = []
-            for ks in range_constexpr(K_STEPS):
-                q_col = fx.Int32(ks * MFMA_DIM_K) + lane_div_16 * fx.Int32(MFMA_DIM_LANE_K)
+            pairs = {}
+            for p in range_constexpr(K_STEPS // 2):
                 for qg in range_constexpr(Q_SUBTILES):
                     row = qt_idx * fx.Int32(BLOCK_M) + q_blk_off(qg) + lane_mod_16
                     safe = (row < seq_len).select(seq_start + row, seq_start)
-                    raws.append(
+                    pairs[(p, qg)] = Vec(
                         q_load(
-                            fx.Int64(safe), head_idx, q_col // fx.Int32(MFMA_DIM_LANE_K)
+                            fx.Int64(safe), head_idx,
+                            fx.Int32(p * (32 // Q_VEC)) + lane_div_16,
+                        )
+                    )
+            raws = []
+            for ks in range_constexpr(K_STEPS):
+                h = ks % 2
+                for qg in range_constexpr(Q_SUBTILES):
+                    v8 = pairs[(ks // 2, qg)]
+                    raws.append(
+                        Vec.from_elements(
+                            [v8[h * MFMA_DIM_LANE_K + j] for j in range_constexpr(MFMA_DIM_LANE_K)],
+                            elem_dtype,
                         ).ir_value()
                     )
             return raws
@@ -1668,8 +1696,7 @@ def build_hstu_attention_fwd_pp(
             row (0..BLOCK_N-1) so it matches the store's layout.
             """
             local_k_row = fx.Int32(ng * MFMA_M) + lane_mod_16
-            # k_col = ks*MFMA_K + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
-            k_col_grp = fx.Int32(ks * (MFMA_DIM_K // MFMA_DIM_LANE_K)) + lane_div_16
+            k_col_grp = qk_col_grp(ks)
             return ks_mem[local_k_row, k_swz_grp(local_k_row, k_col_grp), None].load()
 
         def read_v_unit(c, ng, vs_mem):
