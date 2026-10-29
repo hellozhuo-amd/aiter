@@ -589,6 +589,7 @@ def build_hstu_attention_fwd_pp(
     # a loop-invariant wave predicate.
     BIAS_MASK = has_window and causal and not has_contextual and USE_SIGMA_LUT
     BIAS_HUGE = float(2.0**40)
+    Q_TILES_PER_WG = int(__import__("os").environ.get("HSTU_PP_QT", 2))
     N_BINIT = KV_SUBTILES * Q_SUBTILES if BIAS_MASK else 0
     # The MFMA after which phase M starts dropping the next tile's slot SALU
     # into the shadows, one small piece per MFMA.
@@ -730,7 +731,7 @@ def build_hstu_attention_fwd_pp(
         seq_offsets: fx.Tensor,
         num_targets: fx.Tensor,
         out: fx.Tensor,
-        num_q_tiles: fx.Int32,
+        num_q_groups: fx.Int32,
         hz_per_group: fx.Int32,
         hz_total: fx.Int32,
         inv_n: fx.Float32,
@@ -767,8 +768,8 @@ def build_hstu_attention_fwd_pp(
         block_id = fx.Int32(gpu.block_idx.x)
         grid_group = block_id % fx.Int32(NUM_GRID_GROUPS)
         pos_in_group = block_id // fx.Int32(NUM_GRID_GROUPS)
-        local_hz_idx = pos_in_group // num_q_tiles
-        q_tile_idx = pos_in_group % num_q_tiles
+        local_hz_idx = pos_in_group // num_q_groups
+        q_grp_idx = pos_in_group % num_q_groups
         hz_idx = grid_group * hz_per_group + local_hz_idx
 
         # hz_per_group is a ceil -> the last group is padded past batch*num_heads. Padding blocks
@@ -929,1634 +930,1651 @@ def build_hstu_attention_fwd_pp(
                 << fx.Int32(K_SWZ_SHIFT - MFMA_DIM_LANE_K_LOG2)
             )
 
-        # ---- Which 16-row blocks of the Q tile this wave owns ---------------
-        # Contiguous (`wave_id * ROWS_PER_WAVE + qg * MFMA_M`) hands wave w the
-        # rows [w*ROWS_PER_WAVE, +ROWS_PER_WAVE), so its Q_SUBTILES blocks are
-        # ADJACENT. That concentrates the causal diagonal: over the masked
-        # remainder, every tile has some wave sitting entirely below the
-        # diagonal, which must gate all of its sub-blocks. Phase V ends at a
-        # barrier, so the workgroup pays that wave -- and skipping the
-        # fully-masked sub-blocks would recover 5% of the gate.
-        #
-        # Interleaving the blocks instead (wave w owns w, w+NUM_WAVES,
-        # w+2*NUM_WAVES, ...) makes every wave straddle the whole Q tile, so
-        # the diagonal is spread evenly and max-over-waves falls to 62% of the
-        # gate and 12.5% of the mask (the floor for any mapping is 56%).
-        #
-        # Nothing else depends on a wave's rows being contiguous: a wave still
-        # reads and writes MFMA_M consecutive rows per sub-tile, so the Q load
-        # and the O store keep their coalescing.
-        #
-        # MEASURED OFF, because it is not free: 115.0 -> 116.3/116.5 ms over two
-        # runs, a reproducible +1.2% with no other change. The balance is tied
-        # to how far a wave's blocks are spread (span 384 rows gives gate 80,
-        # span 192 gives 104, span 48 -- contiguous -- gives 122), so there is
-        # no cheap middle. Against the masked loop's 4.3% ceiling that leaves
-        # ~1.9% net, where branching on the contiguous mapping alone already
-        # takes ~0.9% for free: it recovers only 5% of the GATE but 75% of the
-        # MASK, which does not depend on the spread.
-        Q_BLK_INTERLEAVE = True
-        q_tile_base = q_tile_idx * fx.Int32(BLOCK_M)
+        # ---- Q tiles: Q_TILES_PER_WG consecutive tiles per workgroup -------
+        # At one WG per CU nothing overlaps a workgroup's prologue and epilogue,
+        # and under a window the KV loop is short enough that they were ~27% of
+        # the workgroup's time at (256,32). Walking several Q tiles of the same
+        # (batch, head) per workgroup pays the launch, the sequence lookup and
+        # the LUT / bias-table builds once.
+        for _qt in range(fx.Int32(0), fx.Int32(Q_TILES_PER_WG), fx.Int32(1)):
+            q_tile_idx = q_grp_idx * fx.Int32(Q_TILES_PER_WG) + fx.Int32(_qt)
+            first_qt = fx.Int32(_qt) == fx.Int32(0)
 
-        def q_blk_base(qg):
-            """First row of this wave's `qg`-th 16-row block of the Q tile."""
-            if const_expr(Q_BLK_INTERLEAVE):
-                return q_tile_base + (
-                    wave_id + fx.Int32(qg * NUM_WAVES)
-                ) * fx.Int32(MFMA_M)
-            return (
-                q_tile_base
-                + wave_id * fx.Int32(ROWS_PER_WAVE)
-                + fx.Int32(qg * MFMA_M)
-            )
+            # ---- Which 16-row blocks of the Q tile this wave owns ---------------
+            # Contiguous (`wave_id * ROWS_PER_WAVE + qg * MFMA_M`) hands wave w the
+            # rows [w*ROWS_PER_WAVE, +ROWS_PER_WAVE), so its Q_SUBTILES blocks are
+            # ADJACENT. That concentrates the causal diagonal: over the masked
+            # remainder, every tile has some wave sitting entirely below the
+            # diagonal, which must gate all of its sub-blocks. Phase V ends at a
+            # barrier, so the workgroup pays that wave -- and skipping the
+            # fully-masked sub-blocks would recover 5% of the gate.
+            #
+            # Interleaving the blocks instead (wave w owns w, w+NUM_WAVES,
+            # w+2*NUM_WAVES, ...) makes every wave straddle the whole Q tile, so
+            # the diagonal is spread evenly and max-over-waves falls to 62% of the
+            # gate and 12.5% of the mask (the floor for any mapping is 56%).
+            #
+            # Nothing else depends on a wave's rows being contiguous: a wave still
+            # reads and writes MFMA_M consecutive rows per sub-tile, so the Q load
+            # and the O store keep their coalescing.
+            #
+            # MEASURED OFF, because it is not free: 115.0 -> 116.3/116.5 ms over two
+            # runs, a reproducible +1.2% with no other change. The balance is tied
+            # to how far a wave's blocks are spread (span 384 rows gives gate 80,
+            # span 192 gives 104, span 48 -- contiguous -- gives 122), so there is
+            # no cheap middle. Against the masked loop's 4.3% ceiling that leaves
+            # ~1.9% net, where branching on the contiguous mapping alone already
+            # takes ~0.9% for free: it recovers only 5% of the GATE but 75% of the
+            # MASK, which does not depend on the spread.
+            Q_BLK_INTERLEAVE = True
+            q_tile_base = q_tile_idx * fx.Int32(BLOCK_M)
 
-        # ---- Q rows / bounds per query sub-tile ----
-        q_rows = []
-        q_in_bounds = []
-        for qg in range_constexpr(Q_SUBTILES):
-            local = q_blk_base(qg) + lane_mod_16
-            q_rows.append(local)
-            q_in_bounds.append(local < seq_len)
-
-        # ---- Q B-operand packs (register-resident, per query sub-tile); q_packs[ks][qg] ----
-        q_packs = []
-        for ks in range_constexpr(K_STEPS):
-            # column within the head
-            q_col = fx.Int32(ks * MFMA_DIM_K) + lane_div_16 * fx.Int32(MFMA_DIM_LANE_K)
-            per_qg = []
-            for qg in range_constexpr(Q_SUBTILES):
-                safe = q_in_bounds[qg].select(seq_start + q_rows[qg], seq_start)
-                raw = q_load(
-                    fx.Int64(safe), head_idx, q_col // fx.Int32(MFMA_DIM_LANE_K)
-                ).ir_value()
-                per_qg.append(q_in_bounds[qg].select(raw, c_zero_dim_pack))
-            q_packs.append(per_qg)
-
-        # ---- Score-gate helpers ----
-        # exp2(x*-log2e) == e^-x, so amdgcn.exp2/rcp build sigmoid(alpha*s) without a slow exp. Fuse
-        # alpha and -log2e into one scale g = s*(alpha*-log2e): it is both the exp2 arg and the outer
-        # factor p = g*sigm = (-log2e)*silu(alpha*s), so the loop does 2 muls not 3. The residual
-        # -1/log2e rides the O-epilogue 1/N mul. Fast-fp comes from _hstu_compile_hints.
-        c_alpha_neg_log2e = fx.Float32(alpha * -_LOG2E)
-        c_one_f = fx.Float32(1.0)
-        c_zero_f = fx.Float32(0.0)
-        # Column id for a position past the end of the sequence: larger than
-        # any query id, small enough that a query id minus it cannot wrap.
-        COL_OOB = fx.Int32(1 << 30)
-
-        def _rcp(x):
-            return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
-
-        # ---- Index via the magic-number trick -------------------------------
-        # Biasing into [2^21, 2^22) puts the node index in the float's MANTISSA
-        # field, already scaled by 4: the ULP there is 0.25, so
-        # `bits & 0x7FFFFF == 4*(t - 2^21)`. The index is then a bit extract
-        # rather than a convert plus a shift -- `v_bfe_u32` where the direct
-        # form needed `v_cvt_i32_f32` + `v_lshlrev_b32`.
-        #
-        # The cost: the bias must be a multiple of the 0.25 ULP, so the
-        # rounding point jitters by up to +-0.125 node instead of sitting at
-        # 0.5, widening the worst-case node distance from 0.5h to 0.625h. Max
-        # relative error on sigma 3.906e-3 -> 3.998e-3, against bf16's own
-        # 7.812e-3 floor. 711.5 is the best of the three quarters bracketing
-        # the ideal 711.611 (711.25 and 711.75 both measure 5.8e-3).
-        _LUT_MAGIC = float(2**21)
-        _LUT_BIG = _LUT_MAGIC + round(_LUT_BIAS * 4.0) / 4.0
-        c_lut_scale = fx.Float32(_LUT_SCALE)
-        c_lut_big = fx.Float32(_LUT_BIG)
-        c_lut_lo = fx.Float32(_LUT_MAGIC)
-        # Under BIAS_MASK the top clamp lands on the extra sigma = 0 entry, so a
-        # biased (dropped) score gates to exactly 0.
-        c_lut_hi = fx.Float32(_LUT_MAGIC + float(_LUT_TAB - 1))
-
-        def lut_index(gv):
-            """sigma(g) = 1/(1+2^g) by table lookup. Three full-rate ops and
-            one ds_read, against v_exp_f32 + v_add_f32 + v_rcp_f32."""
-            t = gv * c_lut_scale + c_lut_big
-            t = fx.Float32(
-                llvm.call_intrinsic(
-                    fx.Float32.ir_type,
-                    "llvm.amdgcn.fmed3.f32",
-                    [t.ir_value(), c_lut_lo.ir_value(), c_lut_hi.ir_value()],
-                    [],
-                    [],
+            def q_blk_base(qg):
+                """First row of this wave's `qg`-th 16-row block of the Q tile."""
+                if const_expr(Q_BLK_INTERLEAVE):
+                    return q_tile_base + (
+                        wave_id + fx.Int32(qg * NUM_WAVES)
+                    ) * fx.Int32(MFMA_M)
+                return (
+                    q_tile_base
+                    + wave_id * fx.Int32(ROWS_PER_WAVE)
+                    + fx.Int32(qg * MFMA_M)
                 )
-            )
-            return (t.bitcast(fx.Int32) >> fx.Int32(2)) & fx.Int32(0x1FFFFF)
 
-        def lut_load(idx):
-            return Vec(lut_mem[idx, None].load())[0]
+            # ---- Q rows / bounds per query sub-tile ----
+            q_rows = []
+            q_in_bounds = []
+            for qg in range_constexpr(Q_SUBTILES):
+                local = q_blk_base(qg) + lane_mod_16
+                q_rows.append(local)
+                q_in_bounds.append(local < seq_len)
 
-        def lut_sigma(gv):
-            return lut_load(lut_index(gv))
+            # ---- Q B-operand packs (register-resident, per query sub-tile); q_packs[ks][qg] ----
+            q_packs = []
+            for ks in range_constexpr(K_STEPS):
+                # column within the head
+                q_col = fx.Int32(ks * MFMA_DIM_K) + lane_div_16 * fx.Int32(MFMA_DIM_LANE_K)
+                per_qg = []
+                for qg in range_constexpr(Q_SUBTILES):
+                    safe = q_in_bounds[qg].select(seq_start + q_rows[qg], seq_start)
+                    raw = q_load(
+                        fx.Int64(safe), head_idx, q_col // fx.Int32(MFMA_DIM_LANE_K)
+                    ).ir_value()
+                    per_qg.append(q_in_bounds[qg].select(raw, c_zero_dim_pack))
+                q_packs.append(per_qg)
 
-        def build_sigma_lut():
-            """Fill the table once per workgroup. ~5 rounds over BLOCK_THREADS,
-            against the ~270 KV tiles that follow -- amortises to nothing."""
-            for r in range_constexpr(_LUT_ROUNDS):
-                _idx = tid + fx.Int32(r * BLOCK_THREADS)
-                # Clamp rather than branch: the surplus threads of the last
-                # round all write the LAST entry, and because the value is
-                # derived from the CLAMPED index they write the same bits, so
-                # the redundant stores are benign rather than a race.
-                _idx = (_idx < fx.Int32(_LUT_TAB)).select(_idx, fx.Int32(_LUT_TAB - 1))
-                _gv = _idx.to(fx.Float32) * fx.Float32(_LUT_H) + fx.Float32(_LUT_GLO)
-                _sg = _rcp(c_one_f + exp2_f32(_gv))
-                if const_expr(_LUT_TAB > _LUT_N):
-                    _sg = (_idx < fx.Int32(_LUT_N)).select(_sg, c_zero_f)
-                lut_mem[_idx, fx.Int32(0)] = _sg
+            # ---- Score-gate helpers ----
+            # exp2(x*-log2e) == e^-x, so amdgcn.exp2/rcp build sigmoid(alpha*s) without a slow exp. Fuse
+            # alpha and -log2e into one scale g = s*(alpha*-log2e): it is both the exp2 arg and the outer
+            # factor p = g*sigm = (-log2e)*silu(alpha*s), so the loop does 2 muls not 3. The residual
+            # -1/log2e rides the O-epilogue 1/N mul. Fast-fp comes from _hstu_compile_hints.
+            c_alpha_neg_log2e = fx.Float32(alpha * -_LOG2E)
+            c_one_f = fx.Float32(1.0)
+            c_zero_f = fx.Float32(0.0)
+            # Column id for a position past the end of the sequence: larger than
+            # any query id, small enough that a query id minus it cannot wrap.
+            COL_OOB = fx.Int32(1 << 30)
 
-        def silu_scale_batch(s_list):
-            """silu(alpha*s) via the -log2e base change, stage-batched for ILP. Returns
-            p = g*sigm with g = (alpha*-log2e)*s, so p = (-log2e)*silu(alpha*s); the -1/log2e is
-            recovered in the O epilogue. A masked/zeroed score gives g=0 -> exp2(0)=1 -> sig=0.5
-            -> p=0.
+            def _rcp(x):
+                return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
 
-            `g` IS the incoming score: the (alpha*-log2e) scale is folded into
-            the Q operand once per workgroup (see `scale_q_pack`) rather than
-            applied to every gated element of every KV tile. The ATT trace had
-            `v_mul_f32` at 516,224 executions against 258,048 gated elements --
-            exactly two per element -- and this removes one of them."""
-            g = s_list
-            if const_expr(USE_SIGMA_LUT):
-                sig = [lut_sigma(gi) for gi in g]
-            else:
-                emu = [exp2_f32(gi) for gi in g]
-                den = [c_one_f + e for e in emu]
-                sig = [_rcp(d) for d in den]
-            return [g[i] * sig[i] for i in range(len(s_list))]
+            # ---- Index via the magic-number trick -------------------------------
+            # Biasing into [2^21, 2^22) puts the node index in the float's MANTISSA
+            # field, already scaled by 4: the ULP there is 0.25, so
+            # `bits & 0x7FFFFF == 4*(t - 2^21)`. The index is then a bit extract
+            # rather than a convert plus a shift -- `v_bfe_u32` where the direct
+            # form needed `v_cvt_i32_f32` + `v_lshlrev_b32`.
+            #
+            # The cost: the bias must be a multiple of the 0.25 ULP, so the
+            # rounding point jitters by up to +-0.125 node instead of sitting at
+            # 0.5, widening the worst-case node distance from 0.5h to 0.625h. Max
+            # relative error on sigma 3.906e-3 -> 3.998e-3, against bf16's own
+            # 7.812e-3 floor. 711.5 is the best of the three quarters bracketing
+            # the ideal 711.611 (711.25 and 711.75 both measure 5.8e-3).
+            _LUT_MAGIC = float(2**21)
+            _LUT_BIG = _LUT_MAGIC + round(_LUT_BIAS * 4.0) / 4.0
+            c_lut_scale = fx.Float32(_LUT_SCALE)
+            c_lut_big = fx.Float32(_LUT_BIG)
+            c_lut_lo = fx.Float32(_LUT_MAGIC)
+            # Under BIAS_MASK the top clamp lands on the extra sigma = 0 entry, so a
+            # biased (dropped) score gates to exactly 0.
+            c_lut_hi = fx.Float32(_LUT_MAGIC + float(_LUT_TAB - 1))
 
-        def to_id(x):
-            """Raw position -> masked id (contextual prefix shift, then target-tail clamp)."""
-            xid = x
-            if has_contextual:
-                xid = xid - fx.Int32(contextual_seq_len - 1)
-                xid = (xid < fx.Int32(0)).select(fx.Int32(0), xid)
-            if has_targets:
-                xid = (xid > max_id).select(max_id, xid)
-            return xid
+            def lut_index(gv):
+                """sigma(g) = 1/(1+2^g) by table lookup. Three full-rate ops and
+                one ds_read, against v_exp_f32 + v_add_f32 + v_rcp_f32."""
+                t = gv * c_lut_scale + c_lut_big
+                t = fx.Float32(
+                    llvm.call_intrinsic(
+                        fx.Float32.ir_type,
+                        "llvm.amdgcn.fmed3.f32",
+                        [t.ir_value(), c_lut_lo.ir_value(), c_lut_hi.ir_value()],
+                        [],
+                        [],
+                    )
+                )
+                return (t.bitcast(fx.Int32) >> fx.Int32(2)) & fx.Int32(0x1FFFFF)
 
-        def pack_p(vals):
-            """Pack 4 f32 scores into a bf16/f16 MFMA pack (the GEMM2 A-operand fragment).
+            def lut_load(idx):
+                return Vec(lut_mem[idx, None].load())[0]
 
-            bf16 truncation IS a byte selection -- the high half of each f32 --
-            so one `v_perm_b32` does a pair. The arithmetic spelling
-            `(hi & 0xFFFF0000) | (lo >> 16)` is bit-for-bit the same but costs
-            two VALU after the backend fuses the and/or (`v_lshrrev_b32` +
-            `v_and_or_b32`, measured 3.15% of all active time in the trace).
-            gfx942 has no `v_cvt_pk_bf16_f32`; that is CDNA4 only.
-            """
-            if const_expr(is_bf16):
-                # Bytes 7,6 of src0 (hi) and 3,2 of src1 (lo): the two high halves.
-                sel = fx.Int32(0x07060302)
+            def lut_sigma(gv):
+                return lut_load(lut_index(gv))
 
-                def bf16_pair(lo_f32, hi_f32):
+            def build_sigma_lut():
+                """Fill the table once per workgroup. ~5 rounds over BLOCK_THREADS,
+                against the ~270 KV tiles that follow -- amortises to nothing."""
+                for r in range_constexpr(_LUT_ROUNDS):
+                    _idx = tid + fx.Int32(r * BLOCK_THREADS)
+                    # Clamp rather than branch: the surplus threads of the last
+                    # round all write the LAST entry, and because the value is
+                    # derived from the CLAMPED index they write the same bits, so
+                    # the redundant stores are benign rather than a race.
+                    _idx = (_idx < fx.Int32(_LUT_TAB)).select(_idx, fx.Int32(_LUT_TAB - 1))
+                    _gv = _idx.to(fx.Float32) * fx.Float32(_LUT_H) + fx.Float32(_LUT_GLO)
+                    _sg = _rcp(c_one_f + exp2_f32(_gv))
+                    if const_expr(_LUT_TAB > _LUT_N):
+                        _sg = (_idx < fx.Int32(_LUT_N)).select(_sg, c_zero_f)
+                    lut_mem[_idx, fx.Int32(0)] = _sg
+
+            def silu_scale_batch(s_list):
+                """silu(alpha*s) via the -log2e base change, stage-batched for ILP. Returns
+                p = g*sigm with g = (alpha*-log2e)*s, so p = (-log2e)*silu(alpha*s); the -1/log2e is
+                recovered in the O epilogue. A masked/zeroed score gives g=0 -> exp2(0)=1 -> sig=0.5
+                -> p=0.
+
+                `g` IS the incoming score: the (alpha*-log2e) scale is folded into
+                the Q operand once per workgroup (see `scale_q_pack`) rather than
+                applied to every gated element of every KV tile. The ATT trace had
+                `v_mul_f32` at 516,224 executions against 258,048 gated elements --
+                exactly two per element -- and this removes one of them."""
+                g = s_list
+                if const_expr(USE_SIGMA_LUT):
+                    sig = [lut_sigma(gi) for gi in g]
+                else:
+                    emu = [exp2_f32(gi) for gi in g]
+                    den = [c_one_f + e for e in emu]
+                    sig = [_rcp(d) for d in den]
+                return [g[i] * sig[i] for i in range(len(s_list))]
+
+            def to_id(x):
+                """Raw position -> masked id (contextual prefix shift, then target-tail clamp)."""
+                xid = x
+                if has_contextual:
+                    xid = xid - fx.Int32(contextual_seq_len - 1)
+                    xid = (xid < fx.Int32(0)).select(fx.Int32(0), xid)
+                if has_targets:
+                    xid = (xid > max_id).select(max_id, xid)
+                return xid
+
+            def pack_p(vals):
+                """Pack 4 f32 scores into a bf16/f16 MFMA pack (the GEMM2 A-operand fragment).
+
+                bf16 truncation IS a byte selection -- the high half of each f32 --
+                so one `v_perm_b32` does a pair. The arithmetic spelling
+                `(hi & 0xFFFF0000) | (lo >> 16)` is bit-for-bit the same but costs
+                two VALU after the backend fuses the and/or (`v_lshrrev_b32` +
+                `v_and_or_b32`, measured 3.15% of all active time in the trace).
+                gfx942 has no `v_cvt_pk_bf16_f32`; that is CDNA4 only.
+                """
+                if const_expr(is_bf16):
+                    # Bytes 7,6 of src0 (hi) and 3,2 of src1 (lo): the two high halves.
+                    sel = fx.Int32(0x07060302)
+
+                    def bf16_pair(lo_f32, hi_f32):
+                        return fx.Int32(
+                            llvm.call_intrinsic(
+                                fx.Int32.ir_type,
+                                "llvm.amdgcn.perm",
+                                [
+                                    hi_f32.bitcast(fx.Int32).ir_value(),
+                                    lo_f32.bitcast(fx.Int32).ir_value(),
+                                    sel.ir_value(),
+                                ],
+                                [],
+                                [],
+                            )
+                        )
+
+                    pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
+                    return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
+                elems = [v.to(elem_dtype) for v in vals]
+                return Vec.from_elements(elems, elem_dtype).ir_value()
+
+            def scale_q_pack(pack):
+                """Fold (alpha * -log2e) into one Q operand pack.
+
+                Widening is the exact inverse of `pack_p`'s byte selection: element
+                2w sits in the LOW half of word w and element 2w+1 in the high half,
+                so `word << 16` and `word & 0xFFFF0000` recover them as f32 with no
+                conversion instruction at all.
+
+                Paid K_STEPS * Q_SUBTILES times per WORKGROUP, against the
+                per-element-per-KV-tile multiply it replaces.
+
+                NOT bitwise-equal to scaling the score: the product is rounded back
+                to bf16's 8 mantissa bits here, where before it was applied in f32
+                after the MFMA had accumulated. The error is ~2^-9 relative per
+                term and partly cancels across the contraction; see the module
+                docstring for the measured accuracy.
+                """
+                c16 = fx.Int32(16)
+                chi = fx.Int32(0xFFFF0000)
+                words = Vec(pack).bitcast(fx.Int32)
+                vals = []
+                for w in range_constexpr(MFMA_DIM_LANE_K // 2):
+                    word = words[w]
+                    vals.append((word << c16).bitcast(fx.Float32) * c_alpha_neg_log2e)
+                    vals.append((word & chi).bitcast(fx.Float32) * c_alpha_neg_log2e)
+                return pack_p(vals)
+
+            assert is_bf16, "scale_q_pack assumes the bf16 byte layout"
+            q_packs = [
+                [scale_q_pack(q_packs[ks][qg]) for qg in range_constexpr(Q_SUBTILES)]
+                for ks in range_constexpr(K_STEPS)
+            ]
+
+            q_rows_i32 = q_rows
+            q_row_ids = [to_id(q_rows_i32[qg]) for qg in range_constexpr(Q_SUBTILES)]
+
+            # ---- The causal mask as one per-row BORDER --------------------------
+            # `to_id(col) < to_id(q)` is a per (query, column) test, but to_id is
+            # monotone, so for each query row there is a single RAW column
+            # threshold below which it holds. Precompute that threshold once per
+            # q-subtile and the per-element mask becomes `col < border` -- no
+            # per-column to_id, no second compare. This is `generate_mask_border`
+            # from the gfx950 asm FMHA kernel (tmp/asm/gfx950, which folds the
+            # sequence bound in the same way; we fold it into the COLUMN instead,
+            # via COL_OOB, because our bound is per-column and theirs is uniform).
+            #
+            #   border = min(q_raw + 1, id_ceiling)
+            #
+            # The `+1` absorbs the diagonal for every row whose id is NOT clamped:
+            # `col < q+1` is `col <= q`. id_ceiling is the first raw column that
+            # reaches to_id's ceiling, so a row at the ceiling (a TARGET row) stops
+            # there and needs the diagonal term back -- which is why the equality
+            # compare survives only under has_targets.
+            #
+            # A contextual-prefix row has id 0 and attends the whole prefix
+            # instead, which is the same border with the causal term removed.
+            _CTX_S = contextual_seq_len - 1 if has_contextual else 0
+            _id_ceiling = max_id + fx.Int32(_CTX_S) if has_targets else COL_OOB
+            q_border = []
+            for qg in range_constexpr(Q_SUBTILES):
+                _b = q_rows_i32[qg] + fx.Int32(1)
+                if const_expr(has_targets):
+                    _b = (_b < _id_ceiling).select(_b, _id_ceiling)
+                if const_expr(has_contextual):
+                    _b = (q_row_ids[qg] > fx.Int32(0)).select(_b, _id_ceiling)
+                q_border.append(_b)
+
+            # A window adds one more per-row bound, on the LOW side: a row keeps
+            # col_id >= q_id - max_attn_len. With no contextual prefix to_id is the
+            # identity below max_id and max_id above it, so the same bound holds in
+            # RAW columns -- col >= min(q, max_id) - W -- and the windowed mask is
+            # the causal border plus ONE compare, not a per-column to_id.
+            BORDER_MASK = causal and not has_contextual
+
+            def _win_lo(r):
+                if const_expr(has_targets):
+                    r = (r < _id_ceiling).select(r, _id_ceiling)
+                return r - fx.Int32(max_attn_len)
+
+            q_lo = []
+            if const_expr(has_window and BORDER_MASK):
+                q_lo = [_win_lo(q_rows_i32[qg]) for qg in range_constexpr(Q_SUBTILES)]
+
+            # ---- Wave-uniform bounds, for the per-sub-block diagonal test -------
+            # A 16x16 (qg, ng) sub-block is entirely below the diagonal, entirely
+            # above it, or straddling it, and which one is decided by numbers that
+            # are constant across the wave. Skipping the gate on an above-diagonal
+            # block and the mask on a below-diagonal one is then an SALU branch,
+            # not an exec mask -- but only if the compiler can SEE the condition is
+            # uniform. `wave_id` is `tid // WARP_SIZE`, which its divergence
+            # analysis treats as per-lane, so pin it through readfirstlane.
+            #
+            # Used ONLY in the predicates. The data path keeps the original values
+            # so nothing else in the kernel changes shape.
+            def _sgpr32(x):
+                return fx.Int32(rocdl.readfirstlane(T.i32, x.ir_value()))
+
+            q_blk_lo = [_sgpr32(q_blk_base(qg)) for qg in range_constexpr(Q_SUBTILES)]
+            q_blk_hi = [x + fx.Int32(MFMA_M - 1) for x in q_blk_lo]
+            # The border is monotone non-decreasing in the row only when there is
+            # no contextual prefix (whose rows all carry the ceiling), which is the
+            # same condition the unmasked/masked split already requires.
+            SUBBLK_SKIP = causal and not has_contextual
+            if const_expr(SUBBLK_SKIP):
+                def _row_border(r):
+                    b = r + fx.Int32(1)
+                    if const_expr(has_targets):
+                        b = (b < _id_ceiling).select(b, _id_ceiling)
+                    return b
+
+                q_blk_blo = [_row_border(x) for x in q_blk_lo]
+                q_blk_bhi = [_row_border(x) for x in q_blk_hi]
+                if const_expr(has_window):
+                    q_blk_wlo = [_win_lo(x) for x in q_blk_lo]
+                    q_blk_whi = [_win_lo(x) for x in q_blk_hi]
+
+            # ---- BIAS_MASK: table build, per-tile slot pick, target blocks ------
+            if const_expr(BIAS_MASK):
+                _B_ROWS_PER_SLOT = KV_SUBTILES * WARP_SIZE
+                _B_ROUNDS = (BIAS_ROWS + BLOCK_THREADS - 1) // BLOCK_THREADS
+                c_bias_huge = fx.Float32(BIAS_HUGE)
+
+                def build_bias_table():
+                    """Fill every slot's bias tiles: row = (slot, ng, lane), four
+                    f32 per row in the lane's own accumulator order."""
+                    for r in range_constexpr(_B_ROUNDS):
+                        row = tid + fx.Int32(r * BLOCK_THREADS)
+                        # Surplus threads rewrite the last row with the same bits.
+                        row = (row < fx.Int32(BIAS_ROWS)).select(row, fx.Int32(BIAS_ROWS - 1))
+                        slot = row // fx.Int32(_B_ROWS_PER_SLOT)
+                        ng = (row // fx.Int32(WARP_SIZE)) % fx.Int32(KV_SUBTILES)
+                        ln = row % fx.Int32(WARP_SIZE)
+                        if const_expr(BIAS_FOLD):
+                            vrep = (slot <= fx.Int32(KV_SUBTILES + 1)).select(
+                                slot - fx.Int32(1),
+                                slot + fx.Int32(_JK - KV_SUBTILES - 1),
+                            )
+                        else:
+                            vrep = slot - fx.Int32(1)
+                        # d = q - c = U + b - a, b = lane%16 (query), a = 4*(lane/16)+i (kv)
+                        d0 = (
+                            (vrep - ng) * fx.Int32(MFMA_M)
+                            + ln % fx.Int32(MFMA_N)
+                            - (ln // fx.Int32(MFMA_N)) * fx.Int32(MFMA_LANE_K)
+                        )
+                        vals = []
+                        for i in range_constexpr(MFMA_ELEMS_PER_LANE):
+                            d = d0 - fx.Int32(i)
+                            drop = (d < fx.Int32(0)) | (d > fx.Int32(max_attn_len))
+                            drop = drop & (slot != fx.Int32(BIAS_KEEP_SLOT))
+                            vals.append(drop.select(c_bias_huge, c_zero_f))
+                        mbias_mem[row, None].store(Vec.from_elements(vals, fx.Float32))
+
+                def _smax(a, b):
                     return fx.Int32(
                         llvm.call_intrinsic(
-                            fx.Int32.ir_type,
-                            "llvm.amdgcn.perm",
-                            [
-                                hi_f32.bitcast(fx.Int32).ir_value(),
-                                lo_f32.bitcast(fx.Int32).ir_value(),
-                                sel.ir_value(),
-                            ],
-                            [],
-                            [],
+                            T.i32, "llvm.smax.i32", [a.ir_value(), fx.Int32(b).ir_value()], [], []
                         )
                     )
 
-                pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
-                return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
-            elems = [v.to(elem_dtype) for v in vals]
-            return Vec.from_elements(elems, elem_dtype).ir_value()
-
-        def scale_q_pack(pack):
-            """Fold (alpha * -log2e) into one Q operand pack.
-
-            Widening is the exact inverse of `pack_p`'s byte selection: element
-            2w sits in the LOW half of word w and element 2w+1 in the high half,
-            so `word << 16` and `word & 0xFFFF0000` recover them as f32 with no
-            conversion instruction at all.
-
-            Paid K_STEPS * Q_SUBTILES times per WORKGROUP, against the
-            per-element-per-KV-tile multiply it replaces.
-
-            NOT bitwise-equal to scaling the score: the product is rounded back
-            to bf16's 8 mantissa bits here, where before it was applied in f32
-            after the MFMA had accumulated. The error is ~2^-9 relative per
-            term and partly cancels across the contraction; see the module
-            docstring for the measured accuracy.
-            """
-            c16 = fx.Int32(16)
-            chi = fx.Int32(0xFFFF0000)
-            words = Vec(pack).bitcast(fx.Int32)
-            vals = []
-            for w in range_constexpr(MFMA_DIM_LANE_K // 2):
-                word = words[w]
-                vals.append((word << c16).bitcast(fx.Float32) * c_alpha_neg_log2e)
-                vals.append((word & chi).bitcast(fx.Float32) * c_alpha_neg_log2e)
-            return pack_p(vals)
-
-        assert is_bf16, "scale_q_pack assumes the bf16 byte layout"
-        q_packs = [
-            [scale_q_pack(q_packs[ks][qg]) for qg in range_constexpr(Q_SUBTILES)]
-            for ks in range_constexpr(K_STEPS)
-        ]
-
-        q_rows_i32 = q_rows
-        q_row_ids = [to_id(q_rows_i32[qg]) for qg in range_constexpr(Q_SUBTILES)]
-
-        # ---- The causal mask as one per-row BORDER --------------------------
-        # `to_id(col) < to_id(q)` is a per (query, column) test, but to_id is
-        # monotone, so for each query row there is a single RAW column
-        # threshold below which it holds. Precompute that threshold once per
-        # q-subtile and the per-element mask becomes `col < border` -- no
-        # per-column to_id, no second compare. This is `generate_mask_border`
-        # from the gfx950 asm FMHA kernel (tmp/asm/gfx950, which folds the
-        # sequence bound in the same way; we fold it into the COLUMN instead,
-        # via COL_OOB, because our bound is per-column and theirs is uniform).
-        #
-        #   border = min(q_raw + 1, id_ceiling)
-        #
-        # The `+1` absorbs the diagonal for every row whose id is NOT clamped:
-        # `col < q+1` is `col <= q`. id_ceiling is the first raw column that
-        # reaches to_id's ceiling, so a row at the ceiling (a TARGET row) stops
-        # there and needs the diagonal term back -- which is why the equality
-        # compare survives only under has_targets.
-        #
-        # A contextual-prefix row has id 0 and attends the whole prefix
-        # instead, which is the same border with the causal term removed.
-        _CTX_S = contextual_seq_len - 1 if has_contextual else 0
-        _id_ceiling = max_id + fx.Int32(_CTX_S) if has_targets else COL_OOB
-        q_border = []
-        for qg in range_constexpr(Q_SUBTILES):
-            _b = q_rows_i32[qg] + fx.Int32(1)
-            if const_expr(has_targets):
-                _b = (_b < _id_ceiling).select(_b, _id_ceiling)
-            if const_expr(has_contextual):
-                _b = (q_row_ids[qg] > fx.Int32(0)).select(_b, _id_ceiling)
-            q_border.append(_b)
-
-        # A window adds one more per-row bound, on the LOW side: a row keeps
-        # col_id >= q_id - max_attn_len. With no contextual prefix to_id is the
-        # identity below max_id and max_id above it, so the same bound holds in
-        # RAW columns -- col >= min(q, max_id) - W -- and the windowed mask is
-        # the causal border plus ONE compare, not a per-column to_id.
-        BORDER_MASK = causal and not has_contextual
-
-        def _win_lo(r):
-            if const_expr(has_targets):
-                r = (r < _id_ceiling).select(r, _id_ceiling)
-            return r - fx.Int32(max_attn_len)
-
-        q_lo = []
-        if const_expr(has_window and BORDER_MASK):
-            q_lo = [_win_lo(q_rows_i32[qg]) for qg in range_constexpr(Q_SUBTILES)]
-
-        # ---- Wave-uniform bounds, for the per-sub-block diagonal test -------
-        # A 16x16 (qg, ng) sub-block is entirely below the diagonal, entirely
-        # above it, or straddling it, and which one is decided by numbers that
-        # are constant across the wave. Skipping the gate on an above-diagonal
-        # block and the mask on a below-diagonal one is then an SALU branch,
-        # not an exec mask -- but only if the compiler can SEE the condition is
-        # uniform. `wave_id` is `tid // WARP_SIZE`, which its divergence
-        # analysis treats as per-lane, so pin it through readfirstlane.
-        #
-        # Used ONLY in the predicates. The data path keeps the original values
-        # so nothing else in the kernel changes shape.
-        def _sgpr32(x):
-            return fx.Int32(rocdl.readfirstlane(T.i32, x.ir_value()))
-
-        q_blk_lo = [_sgpr32(q_blk_base(qg)) for qg in range_constexpr(Q_SUBTILES)]
-        q_blk_hi = [x + fx.Int32(MFMA_M - 1) for x in q_blk_lo]
-        # The border is monotone non-decreasing in the row only when there is
-        # no contextual prefix (whose rows all carry the ceiling), which is the
-        # same condition the unmasked/masked split already requires.
-        SUBBLK_SKIP = causal and not has_contextual
-        if const_expr(SUBBLK_SKIP):
-            def _row_border(r):
-                b = r + fx.Int32(1)
-                if const_expr(has_targets):
-                    b = (b < _id_ceiling).select(b, _id_ceiling)
-                return b
-
-            q_blk_blo = [_row_border(x) for x in q_blk_lo]
-            q_blk_bhi = [_row_border(x) for x in q_blk_hi]
-            if const_expr(has_window):
-                q_blk_wlo = [_win_lo(x) for x in q_blk_lo]
-                q_blk_whi = [_win_lo(x) for x in q_blk_hi]
-
-        # ---- BIAS_MASK: table build, per-tile slot pick, target blocks ------
-        if const_expr(BIAS_MASK):
-            _B_ROWS_PER_SLOT = KV_SUBTILES * WARP_SIZE
-            _B_ROUNDS = (BIAS_ROWS + BLOCK_THREADS - 1) // BLOCK_THREADS
-            c_bias_huge = fx.Float32(BIAS_HUGE)
-
-            def build_bias_table():
-                """Fill every slot's bias tiles: row = (slot, ng, lane), four
-                f32 per row in the lane's own accumulator order."""
-                for r in range_constexpr(_B_ROUNDS):
-                    row = tid + fx.Int32(r * BLOCK_THREADS)
-                    # Surplus threads rewrite the last row with the same bits.
-                    row = (row < fx.Int32(BIAS_ROWS)).select(row, fx.Int32(BIAS_ROWS - 1))
-                    slot = row // fx.Int32(_B_ROWS_PER_SLOT)
-                    ng = (row // fx.Int32(WARP_SIZE)) % fx.Int32(KV_SUBTILES)
-                    ln = row % fx.Int32(WARP_SIZE)
-                    if const_expr(BIAS_FOLD):
-                        vrep = (slot <= fx.Int32(KV_SUBTILES + 1)).select(
-                            slot - fx.Int32(1),
-                            slot + fx.Int32(_JK - KV_SUBTILES - 1),
+                def _umin(a, b):
+                    return fx.Int32(
+                        llvm.call_intrinsic(
+                            T.i32, "llvm.umin.i32", [a.ir_value(), fx.Int32(b).ir_value()], [], []
                         )
-                    else:
-                        vrep = slot - fx.Int32(1)
-                    # d = q - c = U + b - a, b = lane%16 (query), a = 4*(lane/16)+i (kv)
-                    d0 = (
-                        (vrep - ng) * fx.Int32(MFMA_M)
-                        + ln % fx.Int32(MFMA_N)
-                        - (ln // fx.Int32(MFMA_N)) * fx.Int32(MFMA_LANE_K)
                     )
-                    vals = []
-                    for i in range_constexpr(MFMA_ELEMS_PER_LANE):
-                        d = d0 - fx.Int32(i)
-                        drop = (d < fx.Int32(0)) | (d > fx.Int32(max_attn_len))
-                        drop = drop & (slot != fx.Int32(BIAS_KEEP_SLOT))
-                        vals.append(drop.select(c_bias_huge, c_zero_f))
-                    mbias_mem[row, None].store(Vec.from_elements(vals, fx.Float32))
 
-            def _smax(a, b):
-                return fx.Int32(
-                    llvm.call_intrinsic(
-                        T.i32, "llvm.smax.i32", [a.ir_value(), fx.Int32(b).ir_value()], [], []
-                    )
-                )
-
-            def _umin(a, b):
-                return fx.Int32(
-                    llvm.call_intrinsic(
-                        T.i32, "llvm.umin.i32", [a.ir_value(), fx.Int32(b).ir_value()], [], []
-                    )
-                )
-
-            def _umax(a, b):
-                return fx.Int32(
-                    llvm.call_intrinsic(
-                        T.i32, "llvm.umax.i32", [a.ir_value(), b.ir_value()], [], []
-                    )
-                )
-
-            def bias_row_pieces(kv_start_fn):
-                """The slot-row computation as a list of small SALU pieces, so
-                phase M can drop them one at a time into its MFMA shadows. Run
-                in order; the rows end up in `st["rows"]`.
-
-                U = q_blk - kv_start is wave-uniform. Each clamp is a SIGNED max
-                then an UNSIGNED min: a same-signedness pair is combined into
-                v_med3_i32, which has no SALU form and drags the whole chain
-                onto the VALU."""
-                st = {"rows": [None] * Q_SUBTILES}
-
-                def _start():
-                    st["kv"] = kv_start_fn()
-
-                def _p0(qg):
-                    u = q_blk_lo[qg] - st["kv"]
-                    st[("u", qg)] = u
-                    st[("lo", qg)] = _smax(u, -MFMA_M)
-                    if const_expr(BIAS_FOLD):
-                        st[("hi", qg)] = _smax(
-                            u - fx.Int32(MFMA_M * _JK), -(MFMA_M - 1)
+                def _umax(a, b):
+                    return fx.Int32(
+                        llvm.call_intrinsic(
+                            T.i32, "llvm.umax.i32", [a.ir_value(), b.ir_value()], [], []
                         )
+                    )
 
-                def _p1(qg):
-                    if const_expr(BIAS_FOLD):
-                        lo = _umin(
-                            st[("lo", qg)] + fx.Int32(MFMA_M),
-                            MFMA_M * (KV_SUBTILES + 1),
-                        )
-                        # The bounds sit 15 off the multiples of 16 and the
-                        # result is re-aligned with a mask: with exact bounds
-                        # instcombine sees smax(., 0) as non-negative, turns
-                        # the umin into smin, and the pair fuses after all.
-                        hi = _umin(
-                            st[("hi", qg)] + fx.Int32(MFMA_M - 1),
-                            MFMA_M * _BR + MFMA_M - 1,
-                        ) & fx.Int32(-MFMA_M)
-                        st[("s16", qg)] = lo + hi
-                    else:
-                        st[("s16", qg)] = _umin(
-                            st[("lo", qg)] + fx.Int32(MFMA_M),
-                            MFMA_M * (_JT + KV_SUBTILES + 1),
-                        )
+                def bias_row_pieces(kv_start_fn):
+                    """The slot-row computation as a list of small SALU pieces, so
+                    phase M can drop them one at a time into its MFMA shadows. Run
+                    in order; the rows end up in `st["rows"]`.
 
-                def _p2(qg):
-                    row0 = st[("s16", qg)] * fx.Int32(_B_ROWS_PER_SLOT // MFMA_M)
-                    if const_expr(has_targets):
-                        # The zero slot is the LAST one, so a max selects it.
-                        row0 = _umax(row0, q_blk_tgt_row[qg])
-                    st["rows"][qg] = row0
+                    U = q_blk - kv_start is wave-uniform. Each clamp is a SIGNED max
+                    then an UNSIGNED min: a same-signedness pair is combined into
+                    v_med3_i32, which has no SALU form and drags the whole chain
+                    onto the VALU."""
+                    st = {"rows": [None] * Q_SUBTILES}
 
-                pieces = [_start]
-                for qg in range_constexpr(Q_SUBTILES):
-                    pieces += [
-                        functools.partial(_p0, qg),
-                        functools.partial(_p1, qg),
-                        functools.partial(_p2, qg),
+                    def _start():
+                        st["kv"] = kv_start_fn()
+
+                    # Pieces of at most ~3 SALU: an MFMA issues in 4 cy and holds
+                    # the matrix pipe for 16, so three scalar ops fit behind it
+                    # for free and a fourth delays the next MFMA.
+                    def _p0(qg):
+                        u = q_blk_lo[qg] - st["kv"]
+                        st[("u", qg)] = u
+                        st[("lo", qg)] = _smax(u, -MFMA_M)
+
+                    def _p1(qg):
+                        if const_expr(BIAS_FOLD):
+                            st[("hi", qg)] = _smax(
+                                st[("u", qg)] - fx.Int32(MFMA_M * _JK), -(MFMA_M - 1)
+                            )
+                            st[("lo", qg)] = _umin(
+                                st[("lo", qg)] + fx.Int32(MFMA_M),
+                                MFMA_M * (KV_SUBTILES + 1),
+                            )
+                        else:
+                            st[("lo", qg)] = _umin(
+                                st[("lo", qg)] + fx.Int32(MFMA_M),
+                                MFMA_M * (_JT + KV_SUBTILES + 1),
+                            )
+
+                    def _p2(qg):
+                        if const_expr(BIAS_FOLD):
+                            # The bounds sit 15 off the multiples of 16 and the
+                            # result is re-aligned with a mask: with exact bounds
+                            # instcombine sees smax(., 0) as non-negative, turns
+                            # the umin into smin, and the pair fuses after all.
+                            st[("hi", qg)] = _umin(
+                                st[("hi", qg)] + fx.Int32(MFMA_M - 1),
+                                MFMA_M * _BR + MFMA_M - 1,
+                            ) & fx.Int32(-MFMA_M)
+
+                    def _p3(qg):
+                        s16 = st[("lo", qg)]
+                        if const_expr(BIAS_FOLD):
+                            s16 = s16 + st[("hi", qg)]
+                        row0 = s16 * fx.Int32(_B_ROWS_PER_SLOT // MFMA_M)
+                        if const_expr(has_targets):
+                            # The zero slot is the LAST one, so a max selects it.
+                            row0 = _umax(row0, q_blk_tgt_row[qg])
+                        st["rows"][qg] = row0
+
+                    pieces = [_start]
+                    for qg in range_constexpr(Q_SUBTILES):
+                        pieces += [
+                            functools.partial(f, qg) for f in (_p0, _p1, _p2, _p3)
+                        ]
+                    return pieces, st
+
+                def bias_rows(kv_start):
+                    """Per q-subtile, the first table row of this tile's slot."""
+                    pieces, st = bias_row_pieces(lambda: kv_start)
+                    for f in pieces:
+                        f()
+                    return st["rows"]
+
+                def bias_init(rows):
+                    """GEMM1's initial accumulators, s_accs[ng][qg], read from the table."""
+                    return [
+                        [
+                            mbias_mem[
+                                rows[qg] + fx.Int32(ng * WARP_SIZE) + lane, None
+                            ].load().ir_value()
+                            for qg in range_constexpr(Q_SUBTILES)
+                        ]
+                        for ng in range_constexpr(KV_SUBTILES)
                     ]
-                return pieces, st
 
-            def bias_rows(kv_start):
-                """Per q-subtile, the first table row of this tile's slot."""
-                pieces, st = bias_row_pieces(lambda: kv_start)
-                for f in pieces:
-                    f()
-                return st["rows"]
-
-            def bias_init(rows):
-                """GEMM1's initial accumulators, s_accs[ng][qg], read from the table."""
-                return [
-                    [
-                        mbias_mem[
-                            rows[qg] + fx.Int32(ng * WARP_SIZE) + lane, None
-                        ].load().ir_value()
+                if const_expr(has_targets):
+                    # A q-block holding a target row (id clamped to max_id). Loop
+                    # invariant, and false everywhere but the sequence's last Q tile.
+                    _has_tgt_rows = max_id < seq_len
+                    q_blk_tgt = [
+                        _has_tgt_rows & (q_blk_hi[qg] >= max_id) & (q_blk_lo[qg] < seq_len)
                         for qg in range_constexpr(Q_SUBTILES)
                     ]
+                    q_blk_tgt_row = [
+                        x.select(fx.Int32(BIAS_KEEP_SLOT * _B_ROWS_PER_SLOT), fx.Int32(0))
+                        for x in q_blk_tgt
+                    ]
+                    wave_tgt = q_blk_tgt[0]
+                    for qg in range_constexpr(1, Q_SUBTILES):
+                        wave_tgt = wave_tgt | q_blk_tgt[qg]
+
+            # ---- KV range: causal upper bound + active predicate ----
+            q_start = q_tile_idx * fx.Int32(BLOCK_M)
+            q_end = q_start + fx.Int32(BLOCK_M)
+            base_upper = seq_len
+            if causal:
+                clamped = (q_end < seq_len).select(q_end, seq_len)
+                if has_contextual:
+                    # The prefix block holds logical row id 0, which attends the whole contextual
+                    # prefix (col_id < max_id) above its diagonal, so its KV range opens to seq_len.
+                    # Other blocks are pure causal and their high tiles are fully masked.
+                    ctx_block = q_start < fx.Int32(contextual_seq_len)
+                    base_upper = ctx_block.select(seq_len, clamped)
+                else:
+                    base_upper = clamped
+            active = q_start < seq_len
+            kv_upper = active.select(base_upper, fx.Int32(0))
+            n_tiles = (kv_upper + fx.Int32(BLOCK_N - 1)) // fx.Int32(BLOCK_N)
+
+            # ---- Sliding-window lower bound: skip fully-masked low KV tiles ----
+            kv_tile_start = fx.Int32(0)
+            if has_window:
+                eff_q_low = (q_start < max_id).select(q_start, max_id)
+                kv_lower = eff_q_low - fx.Int32(max_attn_len)
+                kv_lower = (kv_lower > fx.Int32(0)).select(kv_lower, fx.Int32(0))
+                win_tile_start = kv_lower // fx.Int32(BLOCK_N)
+                if has_contextual:
+                    # The prefix block must walk KV from 0 to see the prefix; the window lower bound
+                    # would otherwise skip the low tiles the prefix opener needs.
+                    ctx_prefix_block = q_start < fx.Int32(contextual_seq_len)
+                    kv_tile_start = ctx_prefix_block.select(fx.Int32(0), win_tile_start)
+                else:
+                    kv_tile_start = win_tile_start
+
+            N_ACC = D_CHUNKS * Q_SUBTILES
+            c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+
+            # ---- Group-staged K/V prefetch -----------------------------------------
+            # Indices are in GROUP-local thread id: each group covers the whole tile
+            # with its own 256 threads.
+            kv_row_in_batch = grp_tid // fx.Int32(THREADS_PER_ROW_KV)
+            kv_lane_in_row = grp_tid % fx.Int32(THREADS_PER_ROW_KV)
+            kv_col = kv_lane_in_row * fx.Int32(VEC_KV)
+            # ...the same column in MFMA_LANE_K-group units (VEC_KV is
+            # MFMA_LANE_K-aligned -> const multiply, no runtime divide), for the
+            # swizzled K store.
+            kv_col_grp = kv_lane_in_row * fx.Int32(VEC_KV // MFMA_DIM_LANE_K)
+
+            # ---- The V slot rotation, as a per-lane tile select -----------------
+            # A lane's VEC_KV contiguous d values all land in ONE d-chunk (VEC_KV
+            # divides MFMA_M), so "which chunk am I staging" is a single per-lane
+            # predicate. Rotated lanes stage the NEXT tile's chunk; everyone else
+            # stages this tile's. That is the whole cost of V_ROT_DT -- the store
+            # destination is untouched, because the rotation changes which tile a
+            # lane reads, not where it writes.
+            kv_rot_lane = (kv_col // fx.Int32(MFMA_M)) < fx.Int32(V_ROT_DT)
+            # g0 stages K, which is NOT rotated, so its bump is always 1.
+            kv_stage_bump = (is_g0 | kv_rot_lane).select(fx.Int32(1), fx.Int32(0))
+
+            def kv_stage_start(kv_tile):
+                """Per-lane byte-row start of the tile this lane stages for `kv_tile`.
+
+                g0: always K(kv_tile + 1). g1: V(kv_tile) for chunks >= V_ROT_DT and
+                V(kv_tile + 1) for the rotated chunks, which is exactly the split
+                `vslot kv_tile % V_SLOTS` is defined to hold.
+                """
+                return (kv_tile + kv_stage_bump) * fx.Int32(BLOCK_N)
+
+            # ---- The staged address, carried and advanced ----------------------
+            # Everything in a staging address except the TILE is loop-invariant:
+            #
+            #   addr(T) = base + (seq_start + T*BLOCK_N + row)*stride + head + col
+            #           = [ base + (seq_start + T0*BLOCK_N + row)*stride + head ]
+            #             + (T - T0) * BLOCK_N * stride
+            #
+            # and `BLOCK_N * stride_token * 2` is a HOST constant. So a trip costs
+            # one 64-bit add, not the 5-instruction chain the per-tile form rebuilt
+            # every time. Same for the guard's token, which advances by BLOCK_N.
+            # This is the fp8 kernel's `advance_hbm_offs`; the per-tile form was
+            # 24 of phase M's 28 VALU rows.
+            # Carried in VEC_KV-element GROUPS, which is what the descriptor view is
+            # indexed in. `token*stride + col` is group-aligned for every lane
+            # (`col` is a multiple of VEC_KV and `stride` is a multiple of it too),
+            # so the division is exact and static.
+            STAGE_ADV = fx.Int32(BLOCK_N * KV_ROW_GRPS)
+            # Past `num_records` by construction: a group index of 2**27 is byte
+            # offset 2**31, and the descriptor can never be that large (the tensor
+            # itself would not fit a 32-bit voffset). Only reachable when
+            # KV_NEEDS_GUARD, and loop-invariant when it is -- the predicate is on
+            # the lane's row within the batch, not on the tile.
+            KV_OOB_VOFS = fx.Int32(1 << 27)
+
+            def stage_seed(kv_tile):
+                """[voffset] for the tile this lane stages at `kv_tile`."""
+                out = []
+                for b in range_constexpr(NUM_BATCHES_KV):
+                    row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
+                    tok = (kv_tile + kv_stage_bump) * fx.Int32(BLOCK_N) + row
+                    vofs = tok * fx.Int32(KV_ROW_GRPS) + kv_col // fx.Int32(VEC_KV)
+                    if const_expr(KV_NEEDS_GUARD):
+                        # The one guard the descriptor cannot express: these lanes
+                        # are in range of the SEQUENCE but outside the TILE, so the
+                        # row they would read is real data belonging to the next
+                        # tile. Push them past num_records by hand, once.
+                        vofs = (kv_row_in_batch < fx.Int32(BLOCK_N)).select(
+                            vofs, KV_OOB_VOFS
+                        )
+                    out.append(vofs)
+                return out
+
+            def stage_advance(voffs):
+                return [x + STAGE_ADV for x in voffs]
+
+            def async_load_kv_regs(voffs):
+                """Issue this group's coalesced global load to registers (non-blocking).
+
+                The out-of-range rows need no fold at all: the descriptor's
+                `num_records` stops at the end of this sequence, so a token past
+                `seq_len` reads back zero in hardware. That used to be a compare, a
+                64-bit address select and a `v_cndmask` per dword, and it had to be
+                split across two phases -- a `select` on a loaded value is a
+                CONSUMER of that load, so applying it here would sink an
+                `s_waitcnt vmcnt(0)` into the issuing phase and collapse the depth-2
+                staging pipeline to depth 1. With the check in the memory pipe there
+                is nothing to split.
+                """
+                return [
+                    kv_buf[voffs[b], None].load().ir_value()
+                    for b in range_constexpr(NUM_BATCHES_KV)
+                ]
+
+            def store_k_regs_to_lds(vecs, ks_mem, part=None):
+                """g0 only: write K vecs to LDS at XOR-swizzled columns.
+
+                `part` selects ONE of the N_STORE_K slices, so the caller can
+                scatter them between individual MFMAs (see mfma_burst)."""
+                _n = -1
+                for b in range_constexpr(NUM_BATCHES_KV):
+                    row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
+                    for h in range_constexpr(VEC_KV // MFMA_DIM_LANE_K):
+                        _n += 1
+                        if const_expr(part is not None and _n != part):
+                            continue
+                        col_grp = kv_col_grp + fx.Int32(h)
+                        half = Vec.from_elements(
+                            [
+                                Vec(vecs[b])[h * MFMA_DIM_LANE_K + j]
+                                for j in range_constexpr(MFMA_DIM_LANE_K)
+                            ],
+                            elem_dtype,
+                        )
+                        ks_mem[row, k_swz_grp(row, col_grp), None].store(half)
+
+            def store_v_regs_to_lds(vecs, vs_mem, part=None):
+                """g1 only: write V vecs to LDS transposed to V[d, kv] so GEMM2 can read 4
+                consecutive kv per ds_read_b64. The lane's VEC_KV d-contiguous elements
+                scatter to kv-fixed, d-varying LDS slots."""
+                # The swizzle key is `(kv_col + j) // VEC_KV`, and j < VEC_KV, so it
+                # equals `kv_col // VEC_KV` for every j -- loop-invariant. Hoisting
+                # it (and the XOR) out of the j loop turns 8 div/and/xor chains into
+                # one; left inside, the live ranges cost 24 VGPR and 5 spills.
+                vkey = v_swz_key(kv_col)
+                _n = -1
+                for b in range_constexpr(NUM_BATCHES_KV):
+                    kv_row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
+                    swz_grp = (kv_row // fx.Int32(MFMA_LANE_K)) ^ vkey
+                    kv_lane = kv_row % fx.Int32(MFMA_LANE_K)
+                    vv = Vec(vecs[b])
+                    for j in range_constexpr(VEC_KV):
+                        _n += 1
+                        if const_expr(part is not None and _n != part):
+                            continue
+                        vs_mem[kv_col + fx.Int32(j), swz_grp, kv_lane] = vv[j]
+
+            # ==== GEMM1: Q*K^T -> P (P fragment already in GEMM2 A-operand layout) ====
+            # ---- Per-UNIT operand readers --------------------------------------
+            # A "unit" is one `ds_read` plus the Q_SUBTILES MFMAs that consume it.
+            # Reading one unit at a time (rather than a whole sub-tile's worth) is
+            # what lets the MFMA burst roll a lookahead window over them, so no MFMA
+            # waits on its own read -- see `mfma_phase`.
+            def read_k_unit(ng, ks, ks_mem):
+                """One K A-operand pack: sub-tile `ng`, contraction step `ks`.
+
+                2D-indexed; the column goes through the shared swizzle, on the LOCAL
+                row (0..BLOCK_N-1) so it matches the store's layout.
+                """
+                local_k_row = fx.Int32(ng * MFMA_M) + lane_mod_16
+                # k_col = ks*MFMA_K + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
+                k_col_grp = fx.Int32(ks * (MFMA_DIM_K // MFMA_DIM_LANE_K)) + lane_div_16
+                return ks_mem[local_k_row, k_swz_grp(local_k_row, k_col_grp), None].load()
+
+            def read_v_unit(c, ng, vs_mem):
+                """One V B-operand pack: d-chunk `c`, kv sub-tile `ng`.
+
+                V[d, kv] transposed, so 4 consecutive kv are contiguous -> one
+                ds_read_b64.
+                """
+                d_col = fx.Int32(c * MFMA_M) + lane_mod_16
+                # kv_lane = ng*MFMA_M + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
+                kv_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
+                return vs_mem[d_col, v_swz_grp(d_col, kv_grp), None].load().ir_value()
+
+            def gemm1_unit(s_accs, ng, ks, k_pack, hook=None):
+                """The Q_SUBTILES MFMAs of one QK unit, chained on s_accs[ng][*]."""
+                for qg in range_constexpr(Q_SUBTILES):
+                    # Operand swap: A=K, B=Q (not A=Q, B=K) so the MFMA result P lands directly in
+                    # GEMM2's A-operand layout (M=query, K=kv) -- P stays register-resident.
+                    q_op = q_packs[ks][qg] if ks < K_STEPS else c_zero_dim_pack
+                    s_accs[ng][qg] = dim_mfma_acc(
+                        Vec(k_pack).ir_value(), q_op, s_accs[ng][qg]
+                    )
+                    if const_expr(hook is not None):
+                        hook()
+                return s_accs
+
+            def gemm2_unit(o_acc, p_packs, c, ng, v_pack, hook=None):
+                """The Q_SUBTILES MFMAs of one PV unit, chained on o_acc[c*Q+*]."""
+                for qg in range_constexpr(Q_SUBTILES):
+                    off = c * Q_SUBTILES + qg
+                    o_acc[off] = mfma_acc(p_packs[ng][qg], v_pack, o_acc[off])
+                    if const_expr(hook is not None):
+                        hook()
+                return o_acc
+
+            def read_unit(spec, ks_mem, vs_mem):
+                """The one `ds_read` of unit `spec`, from the right slot."""
+                kind, j = spec
+                if const_expr(kind == "qk"):
+                    return read_k_unit(j % KV_SUBTILES, j // KV_SUBTILES, ks_mem)
+                return read_v_unit(j % D_CHUNKS, j // D_CHUNKS, vs_mem)
+
+            def apply_unit(spec, operand, o_acc, s_accs, p_packs, hook=None):
+                """The Q_SUBTILES MFMAs of unit `spec`, consuming `operand`."""
+                kind, j = spec
+                if const_expr(kind == "qk"):
+                    s_accs = gemm1_unit(
+                        s_accs, j % KV_SUBTILES, j // KV_SUBTILES, operand, hook
+                    )
+                else:
+                    o_acc = gemm2_unit(
+                        o_acc, p_packs, j % D_CHUNKS, j // D_CHUNKS, operand, hook
+                    )
+                return o_acc, s_accs
+
+            def mfma_burst(
+                o_acc, p_packs, carried, ks_mem, vs_mem, tail_store=None, bias=None, side=None
+            ):
+                """PHASE M's whole MFMA stream: GEMM1 of this tile merged with GEMM2
+                of the previous one, walked as one `UNIT_ORDER` sequence.
+
+                Returns `(o_acc, s_accs)`. The raw fp32 score accumulators go to
+                phase V to be masked and gated -- splitting there is what makes the
+                two phases disjoint: every MFMA is on this side, every
+                transcendental on the other.
+                """
+                if const_expr(bias is not None):
+                    s_accs = bias
+                else:
+                    s_accs = [
+                        [
+                            Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+                            for _ in range_constexpr(Q_SUBTILES)
+                        ]
+                        for _ in range_constexpr(KV_SUBTILES)
+                    ]
+                # Prime the window before the first MFMA, then keep it PREFETCH_DEPTH
+                # units ahead. `sched_barrier` on both sides of each step is what
+                # holds the pattern: without it the scheduler hoists every read to
+                # the head of the phase and the window stops meaning anything.
+                # One staging store after each of the LAST n_store MFMAs, so each
+                # lands in the 12 cy of matrix-pipe shadow behind its MFMA (an MFMA
+                # issues in 4 cy and then owns the pipe for 16; the per-wave
+                # timeline shows `v_mfma dur 4` whenever a non-MFMA follows and
+                # `dur 16` only between back-to-back MFMAs).
+                #
+                # g0 writes 2 ds_write_b64 -> after MFMA #-3 and #-2.
+                # g1 writes 8 ds_write_b16 -> after MFMA #-9 .. #-2.
+                _n_mfma = [0]
+                _n_store = 0 if tail_store is None else tail_store[0]
+                _first = N_UNITS * Q_SUBTILES - _n_store - 1
+
+                _side_res = [None]
+                if const_expr(side is not None):
+                    _side_m0, _side_pieces, _side_st = side
+
+                def _hook():
+                    m = _n_mfma[0]
+                    _n_mfma[0] = m + 1
+                    if const_expr(side is not None):
+                        j = m - _side_m0
+                        if const_expr(0 <= j < len(_side_pieces)):
+                            # One small SALU piece per MFMA shadow, fenced so the
+                            # scheduler cannot regroup them into one clump.
+                            rocdl.sched_barrier(0)
+                            _side_pieces[j]()
+                            if const_expr(j == len(_side_pieces) - 1):
+                                rows = _side_st["rows"]
+                                # Pin the result HERE: left alone, machine sinking
+                                # moves it into phase V next to its first use.
+                                llvm.inline_asm(
+                                    res=None,
+                                    operands_=[x.ir_value() for x in rows],
+                                    asm_string="",
+                                    constraints=",".join("s" for _ in rows),
+                                    has_side_effects=True,
+                                )
+                                _side_res[0] = rows
+                            rocdl.sched_barrier(0)
+                    if const_expr(tail_store is None or m < _first):
+                        return
+                    k = m - _first
+                    if const_expr(k >= _n_store):
+                        return
+                    if const_expr(k == 0):
+                        rocdl.s_waitcnt(vmcnt=0)
+                    # Fence each store individually: `sched_barrier` only guards
+                    # the unit boundaries, so without this the scheduler regroups
+                    # them back into one clump and the per-MFMA shadows are lost.
+                    rocdl.sched_barrier(0)
+                    tail_store[1](k)
+                    rocdl.sched_barrier(0)
+
+                win = [None for _ in range_constexpr(WIN_RING)]
+                # Seeded from the PREVIOUS phase's tail, so the first MFMA of the
+                # burst issues with nothing outstanding.
+                for s in range_constexpr(XPHASE_DEPTH):
+                    win[s % WIN_RING] = carried[s]
+                for s in range_constexpr(XPHASE_DEPTH, PREFETCH_DEPTH):
+                    win[s % WIN_RING] = read_unit(UNIT_ORDER[s], ks_mem, vs_mem)
+                nxt = [None for _ in range_constexpr(XPHASE_DEPTH)]
+                for step in range_constexpr(N_UNITS):
+                    rocdl.sched_barrier(0)
+                    o_acc, s_accs = apply_unit(
+                        UNIT_ORDER[step], win[step % WIN_RING], o_acc, s_accs,
+                        p_packs, _hook,
+                    )
+                    sn = step + PREFETCH_DEPTH
+                    if const_expr(sn < N_UNITS):
+                        win[sn % WIN_RING] = read_unit(
+                            UNIT_ORDER[sn], ks_mem, vs_mem
+                        )
+                    else:
+                        # The tail reads the NEXT phase's first units -- and thanks
+                        # to the rotation, out of the SAME `vs_mem` this phase is
+                        # reading, never the slot being written. That is the whole
+                        # point of V_ROT_DT: no third slot, no extra slot handle.
+                        nxt[sn - N_UNITS] = read_unit(
+                            UNIT_ORDER[sn - N_UNITS], ks_mem, vs_mem
+                        )
+                    # Staging stores, issued STORE_LEAD units before the end of
+                    # the burst instead of after it. An MFMA issues in 4 cy and
+                    # then owns the matrix pipe for 16, so a non-MFMA slots into
+                    # that shadow -- the trace shows `v_mfma dur 4` whenever a
+                    # non-MFMA follows and `dur 16` only between back-to-back
+                    # MFMAs. Placed here, the remaining units' MFMAs cover the
+                    # stores' latency before the phase's closing lgkmcnt(0).
+                    #
+                    # The only reads issued after them are the CROSS-PHASE
+                    # prefetches into `nxt`, whose consumer sits past the phase
+                    # barrier and so waits on that barrier's lgkmcnt(0) anyway.
+                    # The counted waits of this phase's own operand reads are
+                    # untouched -- which is what sank hoisting the stores to the
+                    # TOP of the phase.
+                    rocdl.sched_barrier(0)
+                return o_acc, s_accs, nxt, _side_res[0]
+
+            c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
+
+            def border_keep(col, qg):
+                """Keep predicate of raw column `col` for q-subtile `qg`, border form."""
+                keep = col < q_border[qg]
+                if const_expr(has_window):
+                    keep = keep & (col >= q_lo[qg])
+                if const_expr(has_targets):
+                    # A target row's id is clamped, so its border stops at the
+                    # ceiling and the diagonal has to come back by hand.
+                    keep = keep | (col == q_rows_i32[qg])
+                return keep
+
+            def mask_target_blocks(kv_start, s_accs):
+                """BIAS_MASK, has_targets: per-element border mask on the q-blocks
+                holding target rows. The branch is on a loop-invariant wave
+                predicate, so outside the sequence's last Q tile it is one SALU
+                branch per tile."""
+                sa = [
+                    s_accs[ng][qg]
+                    for ng in range_constexpr(KV_SUBTILES)
+                    for qg in range_constexpr(Q_SUBTILES)
+                ]
+                def _fix(sa):
+                    out = []
+                    for ng in range_constexpr(KV_SUBTILES):
+                        kv_base = (
+                            kv_start
+                            + fx.Int32(ng * MFMA_M)
+                            + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                        )
+                        for qg in range_constexpr(Q_SUBTILES):
+                            cur = Vec(sa[ng * Q_SUBTILES + qg])
+                            vals = []
+                            for i in range_constexpr(MFMA_ELEMS_PER_LANE):
+                                keep = border_keep(kv_base + fx.Int32(i), qg)
+                                keep = keep | ~q_blk_tgt[qg]
+                                vals.append(keep.select(cur[i], c_zero_f))
+                            out.append(Vec.from_elements(vals, fx.Float32).ir_value())
+                    return out
+
+                if wave_tgt:
+                    sa = _fix(sa)
+                return [
+                    [sa[ng * Q_SUBTILES + qg] for qg in range_constexpr(Q_SUBTILES)]
                     for ng in range_constexpr(KV_SUBTILES)
                 ]
 
-            if const_expr(has_targets):
-                # A q-block holding a target row (id clamped to max_id). Loop
-                # invariant, and false everywhere but the sequence's last Q tile.
-                _has_tgt_rows = max_id < seq_len
-                q_blk_tgt = [
-                    _has_tgt_rows & (q_blk_hi[qg] >= max_id) & (q_blk_lo[qg] < seq_len)
-                    for qg in range_constexpr(Q_SUBTILES)
-                ]
-                q_blk_tgt_row = [
-                    x.select(fx.Int32(BIAS_KEEP_SLOT * _B_ROWS_PER_SLOT), fx.Int32(0))
-                    for x in q_blk_tgt
-                ]
-                wave_tgt = q_blk_tgt[0]
-                for qg in range_constexpr(1, Q_SUBTILES):
-                    wave_tgt = wave_tgt | q_blk_tgt[qg]
+            def gate_tile_split(kv_start, s_accs):
+                """PHASE V for a tile that STRADDLES the causal diagonal.
 
-        # ---- KV range: causal upper bound + active predicate ----
-        q_start = q_tile_idx * fx.Int32(BLOCK_M)
-        q_end = q_start + fx.Int32(BLOCK_M)
-        base_upper = seq_len
-        if causal:
-            clamped = (q_end < seq_len).select(q_end, seq_len)
-            if has_contextual:
-                # The prefix block holds logical row id 0, which attends the whole contextual
-                # prefix (col_id < max_id) above its diagonal, so its KV range opens to seq_len.
-                # Other blocks are pure causal and their high tiles are fully masked.
-                ctx_block = q_start < fx.Int32(contextual_seq_len)
-                base_upper = ctx_block.select(seq_len, clamped)
-            else:
-                base_upper = clamped
-        active = q_start < seq_len
-        kv_upper = active.select(base_upper, fx.Int32(0))
-        n_tiles = (kv_upper + fx.Int32(BLOCK_N - 1)) // fx.Int32(BLOCK_N)
+                The masked remainder is BLOCK_M/BLOCK_N tiles wide, and inside it
+                most 16x16 (qg, ng) sub-blocks are not on the diagonal at all --
+                they are entirely below it (every element kept, so the mask is
+                pure overhead) or entirely above it (every element zeroed, so the
+                gate is too: a zeroed score gates to exactly 0). Only the blocks
+                the diagonal passes through need both.
 
-        # ---- Sliding-window lower bound: skip fully-masked low KV tiles ----
-        kv_tile_start = fx.Int32(0)
-        if has_window:
-            eff_q_low = (q_start < max_id).select(q_start, max_id)
-            kv_lower = eff_q_low - fx.Int32(max_attn_len)
-            kv_lower = (kv_lower > fx.Int32(0)).select(kv_lower, fx.Int32(0))
-            win_tile_start = kv_lower // fx.Int32(BLOCK_N)
-            if has_contextual:
-                # The prefix block must walk KV from 0 to see the prefix; the window lower bound
-                # would otherwise skip the low tiles the prefix opener needs.
-                ctx_prefix_block = q_start < fx.Int32(contextual_seq_len)
-                kv_tile_start = ctx_prefix_block.select(fx.Int32(0), win_tile_start)
-            else:
-                kv_tile_start = win_tile_start
-
-        N_ACC = D_CHUNKS * Q_SUBTILES
-        c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
-
-        # ---- Group-staged K/V prefetch -----------------------------------------
-        # Indices are in GROUP-local thread id: each group covers the whole tile
-        # with its own 256 threads.
-        kv_row_in_batch = grp_tid // fx.Int32(THREADS_PER_ROW_KV)
-        kv_lane_in_row = grp_tid % fx.Int32(THREADS_PER_ROW_KV)
-        kv_col = kv_lane_in_row * fx.Int32(VEC_KV)
-        # ...the same column in MFMA_LANE_K-group units (VEC_KV is
-        # MFMA_LANE_K-aligned -> const multiply, no runtime divide), for the
-        # swizzled K store.
-        kv_col_grp = kv_lane_in_row * fx.Int32(VEC_KV // MFMA_DIM_LANE_K)
-
-        # ---- The V slot rotation, as a per-lane tile select -----------------
-        # A lane's VEC_KV contiguous d values all land in ONE d-chunk (VEC_KV
-        # divides MFMA_M), so "which chunk am I staging" is a single per-lane
-        # predicate. Rotated lanes stage the NEXT tile's chunk; everyone else
-        # stages this tile's. That is the whole cost of V_ROT_DT -- the store
-        # destination is untouched, because the rotation changes which tile a
-        # lane reads, not where it writes.
-        kv_rot_lane = (kv_col // fx.Int32(MFMA_M)) < fx.Int32(V_ROT_DT)
-        # g0 stages K, which is NOT rotated, so its bump is always 1.
-        kv_stage_bump = (is_g0 | kv_rot_lane).select(fx.Int32(1), fx.Int32(0))
-
-        def kv_stage_start(kv_tile):
-            """Per-lane byte-row start of the tile this lane stages for `kv_tile`.
-
-            g0: always K(kv_tile + 1). g1: V(kv_tile) for chunks >= V_ROT_DT and
-            V(kv_tile + 1) for the rotated chunks, which is exactly the split
-            `vslot kv_tile % V_SLOTS` is defined to hold.
-            """
-            return (kv_tile + kv_stage_bump) * fx.Int32(BLOCK_N)
-
-        # ---- The staged address, carried and advanced ----------------------
-        # Everything in a staging address except the TILE is loop-invariant:
-        #
-        #   addr(T) = base + (seq_start + T*BLOCK_N + row)*stride + head + col
-        #           = [ base + (seq_start + T0*BLOCK_N + row)*stride + head ]
-        #             + (T - T0) * BLOCK_N * stride
-        #
-        # and `BLOCK_N * stride_token * 2` is a HOST constant. So a trip costs
-        # one 64-bit add, not the 5-instruction chain the per-tile form rebuilt
-        # every time. Same for the guard's token, which advances by BLOCK_N.
-        # This is the fp8 kernel's `advance_hbm_offs`; the per-tile form was
-        # 24 of phase M's 28 VALU rows.
-        # Carried in VEC_KV-element GROUPS, which is what the descriptor view is
-        # indexed in. `token*stride + col` is group-aligned for every lane
-        # (`col` is a multiple of VEC_KV and `stride` is a multiple of it too),
-        # so the division is exact and static.
-        STAGE_ADV = fx.Int32(BLOCK_N * KV_ROW_GRPS)
-        # Past `num_records` by construction: a group index of 2**27 is byte
-        # offset 2**31, and the descriptor can never be that large (the tensor
-        # itself would not fit a 32-bit voffset). Only reachable when
-        # KV_NEEDS_GUARD, and loop-invariant when it is -- the predicate is on
-        # the lane's row within the batch, not on the tile.
-        KV_OOB_VOFS = fx.Int32(1 << 27)
-
-        def stage_seed(kv_tile):
-            """[voffset] for the tile this lane stages at `kv_tile`."""
-            out = []
-            for b in range_constexpr(NUM_BATCHES_KV):
-                row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
-                tok = (kv_tile + kv_stage_bump) * fx.Int32(BLOCK_N) + row
-                vofs = tok * fx.Int32(KV_ROW_GRPS) + kv_col // fx.Int32(VEC_KV)
-                if const_expr(KV_NEEDS_GUARD):
-                    # The one guard the descriptor cannot express: these lanes
-                    # are in range of the SEQUENCE but outside the TILE, so the
-                    # row they would read is real data belonging to the next
-                    # tile. Push them past num_records by hand, once.
-                    vofs = (kv_row_in_batch < fx.Int32(BLOCK_N)).select(
-                        vofs, KV_OOB_VOFS
-                    )
-                out.append(vofs)
-            return out
-
-        def stage_advance(voffs):
-            return [x + STAGE_ADV for x in voffs]
-
-        def async_load_kv_regs(voffs):
-            """Issue this group's coalesced global load to registers (non-blocking).
-
-            The out-of-range rows need no fold at all: the descriptor's
-            `num_records` stops at the end of this sequence, so a token past
-            `seq_len` reads back zero in hardware. That used to be a compare, a
-            64-bit address select and a `v_cndmask` per dword, and it had to be
-            split across two phases -- a `select` on a loaded value is a
-            CONSUMER of that load, so applying it here would sink an
-            `s_waitcnt vmcnt(0)` into the issuing phase and collapse the depth-2
-            staging pipeline to depth 1. With the check in the memory pipe there
-            is nothing to split.
-            """
-            return [
-                kv_buf[voffs[b], None].load().ir_value()
-                for b in range_constexpr(NUM_BATCHES_KV)
-            ]
-
-        def store_k_regs_to_lds(vecs, ks_mem, part=None):
-            """g0 only: write K vecs to LDS at XOR-swizzled columns.
-
-            `part` selects ONE of the N_STORE_K slices, so the caller can
-            scatter them between individual MFMAs (see mfma_burst)."""
-            _n = -1
-            for b in range_constexpr(NUM_BATCHES_KV):
-                row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
-                for h in range_constexpr(VEC_KV // MFMA_DIM_LANE_K):
-                    _n += 1
-                    if const_expr(part is not None and _n != part):
-                        continue
-                    col_grp = kv_col_grp + fx.Int32(h)
-                    half = Vec.from_elements(
-                        [
-                            Vec(vecs[b])[h * MFMA_DIM_LANE_K + j]
-                            for j in range_constexpr(MFMA_DIM_LANE_K)
-                        ],
-                        elem_dtype,
-                    )
-                    ks_mem[row, k_swz_grp(row, col_grp), None].store(half)
-
-        def store_v_regs_to_lds(vecs, vs_mem, part=None):
-            """g1 only: write V vecs to LDS transposed to V[d, kv] so GEMM2 can read 4
-            consecutive kv per ds_read_b64. The lane's VEC_KV d-contiguous elements
-            scatter to kv-fixed, d-varying LDS slots."""
-            # The swizzle key is `(kv_col + j) // VEC_KV`, and j < VEC_KV, so it
-            # equals `kv_col // VEC_KV` for every j -- loop-invariant. Hoisting
-            # it (and the XOR) out of the j loop turns 8 div/and/xor chains into
-            # one; left inside, the live ranges cost 24 VGPR and 5 spills.
-            vkey = v_swz_key(kv_col)
-            _n = -1
-            for b in range_constexpr(NUM_BATCHES_KV):
-                kv_row = kv_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_KV)
-                swz_grp = (kv_row // fx.Int32(MFMA_LANE_K)) ^ vkey
-                kv_lane = kv_row % fx.Int32(MFMA_LANE_K)
-                vv = Vec(vecs[b])
-                for j in range_constexpr(VEC_KV):
-                    _n += 1
-                    if const_expr(part is not None and _n != part):
-                        continue
-                    vs_mem[kv_col + fx.Int32(j), swz_grp, kv_lane] = vv[j]
-
-        # ==== GEMM1: Q*K^T -> P (P fragment already in GEMM2 A-operand layout) ====
-        # ---- Per-UNIT operand readers --------------------------------------
-        # A "unit" is one `ds_read` plus the Q_SUBTILES MFMAs that consume it.
-        # Reading one unit at a time (rather than a whole sub-tile's worth) is
-        # what lets the MFMA burst roll a lookahead window over them, so no MFMA
-        # waits on its own read -- see `mfma_phase`.
-        def read_k_unit(ng, ks, ks_mem):
-            """One K A-operand pack: sub-tile `ng`, contraction step `ks`.
-
-            2D-indexed; the column goes through the shared swizzle, on the LOCAL
-            row (0..BLOCK_N-1) so it matches the store's layout.
-            """
-            local_k_row = fx.Int32(ng * MFMA_M) + lane_mod_16
-            # k_col = ks*MFMA_K + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
-            k_col_grp = fx.Int32(ks * (MFMA_DIM_K // MFMA_DIM_LANE_K)) + lane_div_16
-            return ks_mem[local_k_row, k_swz_grp(local_k_row, k_col_grp), None].load()
-
-        def read_v_unit(c, ng, vs_mem):
-            """One V B-operand pack: d-chunk `c`, kv sub-tile `ng`.
-
-            V[d, kv] transposed, so 4 consecutive kv are contiguous -> one
-            ds_read_b64.
-            """
-            d_col = fx.Int32(c * MFMA_M) + lane_mod_16
-            # kv_lane = ng*MFMA_M + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
-            kv_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
-            return vs_mem[d_col, v_swz_grp(d_col, kv_grp), None].load().ir_value()
-
-        def gemm1_unit(s_accs, ng, ks, k_pack, hook=None):
-            """The Q_SUBTILES MFMAs of one QK unit, chained on s_accs[ng][*]."""
-            for qg in range_constexpr(Q_SUBTILES):
-                # Operand swap: A=K, B=Q (not A=Q, B=K) so the MFMA result P lands directly in
-                # GEMM2's A-operand layout (M=query, K=kv) -- P stays register-resident.
-                q_op = q_packs[ks][qg] if ks < K_STEPS else c_zero_dim_pack
-                s_accs[ng][qg] = dim_mfma_acc(
-                    Vec(k_pack).ir_value(), q_op, s_accs[ng][qg]
-                )
-                if const_expr(hook is not None):
-                    hook()
-            return s_accs
-
-        def gemm2_unit(o_acc, p_packs, c, ng, v_pack, hook=None):
-            """The Q_SUBTILES MFMAs of one PV unit, chained on o_acc[c*Q+*]."""
-            for qg in range_constexpr(Q_SUBTILES):
-                off = c * Q_SUBTILES + qg
-                o_acc[off] = mfma_acc(p_packs[ng][qg], v_pack, o_acc[off])
-                if const_expr(hook is not None):
-                    hook()
-            return o_acc
-
-        def read_unit(spec, ks_mem, vs_mem):
-            """The one `ds_read` of unit `spec`, from the right slot."""
-            kind, j = spec
-            if const_expr(kind == "qk"):
-                return read_k_unit(j % KV_SUBTILES, j // KV_SUBTILES, ks_mem)
-            return read_v_unit(j % D_CHUNKS, j // D_CHUNKS, vs_mem)
-
-        def apply_unit(spec, operand, o_acc, s_accs, p_packs, hook=None):
-            """The Q_SUBTILES MFMAs of unit `spec`, consuming `operand`."""
-            kind, j = spec
-            if const_expr(kind == "qk"):
-                s_accs = gemm1_unit(
-                    s_accs, j % KV_SUBTILES, j // KV_SUBTILES, operand, hook
-                )
-            else:
-                o_acc = gemm2_unit(
-                    o_acc, p_packs, j % D_CHUNKS, j // D_CHUNKS, operand, hook
-                )
-            return o_acc, s_accs
-
-        def mfma_burst(
-            o_acc, p_packs, carried, ks_mem, vs_mem, tail_store=None, bias=None, side=None
-        ):
-            """PHASE M's whole MFMA stream: GEMM1 of this tile merged with GEMM2
-            of the previous one, walked as one `UNIT_ORDER` sequence.
-
-            Returns `(o_acc, s_accs)`. The raw fp32 score accumulators go to
-            phase V to be masked and gated -- splitting there is what makes the
-            two phases disjoint: every MFMA is on this side, every
-            transcendental on the other.
-            """
-            if const_expr(bias is not None):
-                s_accs = bias
-            else:
-                s_accs = [
-                    [
-                        Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
-                        for _ in range_constexpr(Q_SUBTILES)
-                    ]
-                    for _ in range_constexpr(KV_SUBTILES)
-                ]
-            # Prime the window before the first MFMA, then keep it PREFETCH_DEPTH
-            # units ahead. `sched_barrier` on both sides of each step is what
-            # holds the pattern: without it the scheduler hoists every read to
-            # the head of the phase and the window stops meaning anything.
-            # One staging store after each of the LAST n_store MFMAs, so each
-            # lands in the 12 cy of matrix-pipe shadow behind its MFMA (an MFMA
-            # issues in 4 cy and then owns the pipe for 16; the per-wave
-            # timeline shows `v_mfma dur 4` whenever a non-MFMA follows and
-            # `dur 16` only between back-to-back MFMAs).
-            #
-            # g0 writes 2 ds_write_b64 -> after MFMA #-3 and #-2.
-            # g1 writes 8 ds_write_b16 -> after MFMA #-9 .. #-2.
-            _n_mfma = [0]
-            _n_store = 0 if tail_store is None else tail_store[0]
-            _first = N_UNITS * Q_SUBTILES - _n_store - 1
-
-            _side_res = [None]
-            if const_expr(side is not None):
-                _side_m0, _side_pieces, _side_st = side
-
-            def _hook():
-                m = _n_mfma[0]
-                _n_mfma[0] = m + 1
-                if const_expr(side is not None):
-                    j = m - _side_m0
-                    if const_expr(0 <= j < len(_side_pieces)):
-                        # One small SALU piece per MFMA shadow, fenced so the
-                        # scheduler cannot regroup them into one clump.
-                        rocdl.sched_barrier(0)
-                        _side_pieces[j]()
-                        if const_expr(j == len(_side_pieces) - 1):
-                            rows = _side_st["rows"]
-                            # Pin the result HERE: left alone, machine sinking
-                            # moves it into phase V next to its first use.
-                            llvm.inline_asm(
-                                res=None,
-                                operands_=[x.ir_value() for x in rows],
-                                asm_string="",
-                                constraints=",".join("s" for _ in rows),
-                                has_side_effects=True,
-                            )
-                            _side_res[0] = rows
-                        rocdl.sched_barrier(0)
-                if const_expr(tail_store is None or m < _first):
-                    return
-                k = m - _first
-                if const_expr(k >= _n_store):
-                    return
-                if const_expr(k == 0):
-                    rocdl.s_waitcnt(vmcnt=0)
-                # Fence each store individually: `sched_barrier` only guards
-                # the unit boundaries, so without this the scheduler regroups
-                # them back into one clump and the per-MFMA shadows are lost.
-                rocdl.sched_barrier(0)
-                tail_store[1](k)
-                rocdl.sched_barrier(0)
-
-            win = [None for _ in range_constexpr(WIN_RING)]
-            # Seeded from the PREVIOUS phase's tail, so the first MFMA of the
-            # burst issues with nothing outstanding.
-            for s in range_constexpr(XPHASE_DEPTH):
-                win[s % WIN_RING] = carried[s]
-            for s in range_constexpr(XPHASE_DEPTH, PREFETCH_DEPTH):
-                win[s % WIN_RING] = read_unit(UNIT_ORDER[s], ks_mem, vs_mem)
-            nxt = [None for _ in range_constexpr(XPHASE_DEPTH)]
-            for step in range_constexpr(N_UNITS):
-                rocdl.sched_barrier(0)
-                o_acc, s_accs = apply_unit(
-                    UNIT_ORDER[step], win[step % WIN_RING], o_acc, s_accs,
-                    p_packs, _hook,
-                )
-                sn = step + PREFETCH_DEPTH
-                if const_expr(sn < N_UNITS):
-                    win[sn % WIN_RING] = read_unit(
-                        UNIT_ORDER[sn], ks_mem, vs_mem
-                    )
-                else:
-                    # The tail reads the NEXT phase's first units -- and thanks
-                    # to the rotation, out of the SAME `vs_mem` this phase is
-                    # reading, never the slot being written. That is the whole
-                    # point of V_ROT_DT: no third slot, no extra slot handle.
-                    nxt[sn - N_UNITS] = read_unit(
-                        UNIT_ORDER[sn - N_UNITS], ks_mem, vs_mem
-                    )
-                # Staging stores, issued STORE_LEAD units before the end of
-                # the burst instead of after it. An MFMA issues in 4 cy and
-                # then owns the matrix pipe for 16, so a non-MFMA slots into
-                # that shadow -- the trace shows `v_mfma dur 4` whenever a
-                # non-MFMA follows and `dur 16` only between back-to-back
-                # MFMAs. Placed here, the remaining units' MFMAs cover the
-                # stores' latency before the phase's closing lgkmcnt(0).
-                #
-                # The only reads issued after them are the CROSS-PHASE
-                # prefetches into `nxt`, whose consumer sits past the phase
-                # barrier and so waits on that barrier's lgkmcnt(0) anyway.
-                # The counted waits of this phase's own operand reads are
-                # untouched -- which is what sank hoisting the stores to the
-                # TOP of the phase.
-                rocdl.sched_barrier(0)
-            return o_acc, s_accs, nxt, _side_res[0]
-
-        c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
-
-        def border_keep(col, qg):
-            """Keep predicate of raw column `col` for q-subtile `qg`, border form."""
-            keep = col < q_border[qg]
-            if const_expr(has_window):
-                keep = keep & (col >= q_lo[qg])
-            if const_expr(has_targets):
-                # A target row's id is clamped, so its border stops at the
-                # ceiling and the diagonal has to come back by hand.
-                keep = keep | (col == q_rows_i32[qg])
-            return keep
-
-        def mask_target_blocks(kv_start, s_accs):
-            """BIAS_MASK, has_targets: per-element border mask on the q-blocks
-            holding target rows. The branch is on a loop-invariant wave
-            predicate, so outside the sequence's last Q tile it is one SALU
-            branch per tile."""
-            sa = [
-                s_accs[ng][qg]
-                for ng in range_constexpr(KV_SUBTILES)
-                for qg in range_constexpr(Q_SUBTILES)
-            ]
-            def _fix(sa):
-                out = []
+                The test is wave-uniform, so each arm is an SALU branch. What it
+                can recover is bounded by the BARRIER at the end of phase V: the
+                workgroup pays the MAX over its 8 waves, and with the contiguous
+                q-block mapping every remainder tile has some wave sitting wholly
+                below the diagonal, which still gates all 8 of its sub-blocks. So
+                this takes ~75% of the MASK and almost none of the GATE. See
+                Q_BLK_INTERLEAVE for what would unlock the rest, and what it
+                costs.
+                """
+                p_packs = []
                 for ng in range_constexpr(KV_SUBTILES):
-                    kv_base = (
-                        kv_start
-                        + fx.Int32(ng * MFMA_M)
-                        + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                    )
-                    for qg in range_constexpr(Q_SUBTILES):
-                        cur = Vec(sa[ng * Q_SUBTILES + qg])
-                        vals = []
-                        for i in range_constexpr(MFMA_ELEMS_PER_LANE):
-                            keep = border_keep(kv_base + fx.Int32(i), qg)
-                            keep = keep | ~q_blk_tgt[qg]
-                            vals.append(keep.select(cur[i], c_zero_f))
-                        out.append(Vec.from_elements(vals, fx.Float32).ir_value())
-                return out
-
-            if wave_tgt:
-                sa = _fix(sa)
-            return [
-                [sa[ng * Q_SUBTILES + qg] for qg in range_constexpr(Q_SUBTILES)]
-                for ng in range_constexpr(KV_SUBTILES)
-            ]
-
-        def gate_tile_split(kv_start, s_accs):
-            """PHASE V for a tile that STRADDLES the causal diagonal.
-
-            The masked remainder is BLOCK_M/BLOCK_N tiles wide, and inside it
-            most 16x16 (qg, ng) sub-blocks are not on the diagonal at all --
-            they are entirely below it (every element kept, so the mask is
-            pure overhead) or entirely above it (every element zeroed, so the
-            gate is too: a zeroed score gates to exactly 0). Only the blocks
-            the diagonal passes through need both.
-
-            The test is wave-uniform, so each arm is an SALU branch. What it
-            can recover is bounded by the BARRIER at the end of phase V: the
-            workgroup pays the MAX over its 8 waves, and with the contiguous
-            q-block mapping every remainder tile has some wave sitting wholly
-            below the diagonal, which still gates all 8 of its sub-blocks. So
-            this takes ~75% of the MASK and almost none of the GATE. See
-            Q_BLK_INTERLEAVE for what would unlock the rest, and what it
-            costs.
-            """
-            p_packs = []
-            for ng in range_constexpr(KV_SUBTILES):
-                kv_lo = kv_start + fx.Int32(ng * MFMA_M)
-                kv_hi = kv_lo + fx.Int32(MFMA_M - 1)
-                kv_base = kv_lo + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                col_raw = [
-                    kv_base + fx.Int32(i)
-                    for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                ]
-                col_raw = [
-                    (c < seq_len).select(c, COL_OOB) for c in col_raw
-                ]
-                row = []
-                for qg in range_constexpr(Q_SUBTILES):
-                    cur = s_accs[ng][qg]
-                    s_vals = [
-                        Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                    ]
-                    # Above the diagonal: every column is past every row's
-                    # border AND cannot be any row's own token. Or the whole
-                    # block is past the end of the sequence.
-                    all_drop = (kv_lo >= seq_len) | (
-                        (kv_lo > q_blk_hi[qg]) & (kv_lo >= q_blk_bhi[qg])
-                    )
-                    # Below it: every column is inside the sequence and under
-                    # the LOWEST row's border (the border is monotone here).
-                    all_keep = (kv_hi < q_blk_blo[qg]) & (kv_hi < seq_len)
-                    if const_expr(has_window):
-                        # Below the window: every column is under the LOWEST
-                        # row's lower bound, hence under every row's.
-                        all_drop = all_drop | (kv_hi < q_blk_wlo[qg])
-                        # Inside it: every column is at or above the HIGHEST
-                        # row's lower bound, hence above every row's.
-                        all_keep = all_keep & (kv_lo >= q_blk_whi[qg])
-                    # Pre-bound: FlyDSL yields the names an `if` ASSIGNS, and
-                    # it passes their current values in as the else-of-last-
-                    # resort, so they have to exist before the branch.
-                    pk = c_zero_pack
-                    if all_drop:
-                        pk = c_zero_pack
-                    elif all_keep:
-                        pk = pack_p(silu_scale_batch(s_vals))
-                    else:
-                        kept = [
-                            border_keep(col_raw[i], qg).select(s_vals[i], c_zero_f)
-                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                        ]
-                        pk = pack_p(silu_scale_batch(kept))
-                    row.append(pk)
-                p_packs.append(row)
-            return p_packs
-
-        def gate_tile(kv_start, s_accs, apply_mask=True):
-            """PHASE V. Mask + silu gate -> P packs. No memory operation at all.
-
-            apply_mask=False skips the per-element mask (and the column position/bounds math it
-            needs). Only valid for a tile that is fully in-seq and fully valid -- see the causal
-            unmasked-range split in the main loop."""
-            if const_expr(apply_mask and SUBBLK_SKIP):
-                return gate_tile_split(kv_start, s_accs)
-
-            # The masked scores of the WHOLE tile, in (ng, qg, i) order, so that
-            # every aligned run of MFMA_ELEMS_PER_LANE is one accumulator and
-            # the gate can be batched across accumulators (see GATE_BATCH).
-            flat = []
-            for ng in range_constexpr(KV_SUBTILES):
-                if const_expr(apply_mask):
-                    kv_base = (
-                        kv_start
-                        + fx.Int32(ng * MFMA_M)
-                        + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                    )
+                    kv_lo = kv_start + fx.Int32(ng * MFMA_M)
+                    kv_hi = kv_lo + fx.Int32(MFMA_M - 1)
+                    kv_base = kv_lo + lane_div_16 * fx.Int32(MFMA_LANE_K)
                     col_raw = [
                         kv_base + fx.Int32(i)
                         for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
-                    # Fold "this column is past the end of the sequence" into
-                    # the column's own coordinates instead of AND-ing it into
-                    # every (qg, i) predicate. An out-of-seq column gets a raw
-                    # position no query can equal and an id no query can
-                    # exceed, which kills the diagonal term, the causal term
-                    # and the contextual opener at once. That turns 32
-                    # `s_and_b64` into 2 selects per column -- the bound is
-                    # per-COLUMN but the AND was per (query, column).
-                    #
-                    # COL_OOB has to stay small enough that `q_id - COL_OOB`
-                    # does not wrap, because the windowed path still forms that
-                    # difference.
-                    col_in_seq = [
-                        col_raw[i] < seq_len
-                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                    col_raw = [
+                        (c < seq_len).select(c, COL_OOB) for c in col_raw
                     ]
-                    if const_expr(BORDER_MASK):
-                        # The border test is in RAW column positions, so the
-                        # out-of-seq fold is one select and `to_id` never runs
-                        # per column at all.
-                        col_raw = [
-                            col_in_seq[i].select(col_raw[i], COL_OOB)
-                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                        ]
-                    else:
-                        col_raw = [
-                            col_in_seq[i].select(col_raw[i], fx.Int32(-1))
-                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                        ]
-                        col_id = [
-                            col_in_seq[i].select(to_id(col_raw[i]), COL_OOB)
-                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
-                        ]
-                for qg in range_constexpr(Q_SUBTILES):
-                    cur = s_accs[ng][qg]
-                    s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
-
-                    if const_expr(apply_mask):
-                        # keep_col is traced and consumed within this same loop iteration
-                        # (see the comprehension below), so the loop vars it closes over are
-                        # bound at definition time -- B023's late-binding concern doesn't apply.
-                        def keep_col(i):
-                            """causal * window * contextual * target mask for (qg, col i)."""
-                            if const_expr(BORDER_MASK):
-                                return border_keep(col_raw[i], qg)  # noqa: B023
-                            dist = q_row_ids[qg] - col_id[i]  # noqa: B023
-                            if not causal:
-                                # Non-causal: symmetric id distance |q - col|. With the diagonal
-                                # term this admits all in-seq columns (full attention); a window
-                                # then becomes symmetric (|q - col| <= max_attn_len).
-                                dist = (dist > fx.Int32(0)).select(dist, -dist)
-                            # Diagonal compared in RAW positions (q_rows_i32 == col_raw): a query
-                            # always attends its own token, even where to_id's shift+clamp collapses
-                            # distinct ids. The window/causal distance uses to_id ids, so the id
-                            # transform governs only the off-diagonal mask.
-                            keep = (q_rows_i32[qg] == col_raw[i]) | (  # noqa: B023
-                                dist > fx.Int32(0)
-                            )
-                            if has_window:
-                                keep = keep & (dist <= fx.Int32(max_attn_len))
-                            if has_contextual:
-                                # Prefix opener: logical row 0 attends the contextual prefix.
-                                ctx = (q_row_ids[qg] == fx.Int32(0)) & (  # noqa: B023
-                                    col_id[i] < max_id  # noqa: B023
-                                )
-                                keep = keep | ctx
-                            return keep
-
+                    row = []
+                    for qg in range_constexpr(Q_SUBTILES):
+                        cur = s_accs[ng][qg]
                         s_vals = [
-                            keep_col(i).select(s_vals[i], c_zero_f)
+                            Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                        ]
+                        # Above the diagonal: every column is past every row's
+                        # border AND cannot be any row's own token. Or the whole
+                        # block is past the end of the sequence.
+                        all_drop = (kv_lo >= seq_len) | (
+                            (kv_lo > q_blk_hi[qg]) & (kv_lo >= q_blk_bhi[qg])
+                        )
+                        # Below it: every column is inside the sequence and under
+                        # the LOWEST row's border (the border is monotone here).
+                        all_keep = (kv_hi < q_blk_blo[qg]) & (kv_hi < seq_len)
+                        if const_expr(has_window):
+                            # Below the window: every column is under the LOWEST
+                            # row's lower bound, hence under every row's.
+                            all_drop = all_drop | (kv_hi < q_blk_wlo[qg])
+                            # Inside it: every column is at or above the HIGHEST
+                            # row's lower bound, hence above every row's.
+                            all_keep = all_keep & (kv_lo >= q_blk_whi[qg])
+                        # Pre-bound: FlyDSL yields the names an `if` ASSIGNS, and
+                        # it passes their current values in as the else-of-last-
+                        # resort, so they have to exist before the branch.
+                        pk = c_zero_pack
+                        if all_drop:
+                            pk = c_zero_pack
+                        elif all_keep:
+                            pk = pack_p(silu_scale_batch(s_vals))
+                        else:
+                            kept = [
+                                border_keep(col_raw[i], qg).select(s_vals[i], c_zero_f)
+                                for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                            ]
+                            pk = pack_p(silu_scale_batch(kept))
+                        row.append(pk)
+                    p_packs.append(row)
+                return p_packs
+
+            def gate_tile(kv_start, s_accs, apply_mask=True):
+                """PHASE V. Mask + silu gate -> P packs. No memory operation at all.
+
+                apply_mask=False skips the per-element mask (and the column position/bounds math it
+                needs). Only valid for a tile that is fully in-seq and fully valid -- see the causal
+                unmasked-range split in the main loop."""
+                if const_expr(apply_mask and SUBBLK_SKIP):
+                    return gate_tile_split(kv_start, s_accs)
+
+                # The masked scores of the WHOLE tile, in (ng, qg, i) order, so that
+                # every aligned run of MFMA_ELEMS_PER_LANE is one accumulator and
+                # the gate can be batched across accumulators (see GATE_BATCH).
+                flat = []
+                for ng in range_constexpr(KV_SUBTILES):
+                    if const_expr(apply_mask):
+                        kv_base = (
+                            kv_start
+                            + fx.Int32(ng * MFMA_M)
+                            + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                        )
+                        col_raw = [
+                            kv_base + fx.Int32(i)
                             for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                         ]
-                    flat.extend(s_vals)
+                        # Fold "this column is past the end of the sequence" into
+                        # the column's own coordinates instead of AND-ing it into
+                        # every (qg, i) predicate. An out-of-seq column gets a raw
+                        # position no query can equal and an id no query can
+                        # exceed, which kills the diagonal term, the causal term
+                        # and the contextual opener at once. That turns 32
+                        # `s_and_b64` into 2 selects per column -- the bound is
+                        # per-COLUMN but the AND was per (query, column).
+                        #
+                        # COL_OOB has to stay small enough that `q_id - COL_OOB`
+                        # does not wrap, because the windowed path still forms that
+                        # difference.
+                        col_in_seq = [
+                            col_raw[i] < seq_len
+                            for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                        ]
+                        if const_expr(BORDER_MASK):
+                            # The border test is in RAW column positions, so the
+                            # out-of-seq fold is one select and `to_id` never runs
+                            # per column at all.
+                            col_raw = [
+                                col_in_seq[i].select(col_raw[i], COL_OOB)
+                                for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                            ]
+                        else:
+                            col_raw = [
+                                col_in_seq[i].select(col_raw[i], fx.Int32(-1))
+                                for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                            ]
+                            col_id = [
+                                col_in_seq[i].select(to_id(col_raw[i]), COL_OOB)
+                                for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                            ]
+                    for qg in range_constexpr(Q_SUBTILES):
+                        cur = s_accs[ng][qg]
+                        s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
 
-            if const_expr(USE_SIGMA_LUT and GATE_HALVES):
-                # Split the tile in half and software-pipeline the LUT reads.
-                #
-                # Emitted as one block, the 32 reads are issued and then
-                # consumed: the first `s_waitcnt` covers 18 multiplies and the
-                # remaining 14 each need their own, 60 cy of waits against a
-                # `ds_read` measuring 9.50 cy/op.
-                #
-                # Interleaving the halves puts the SECOND half's address math
-                # (3 ops x 16 elements) between the first half's reads and
-                # their consumers, so those reads get ~48 instructions of cover
-                # instead of none.
-                #
-                # Note the address math CANNOT move a phase earlier: `g` is
-                # produced by GEMM1 in the M phase immediately before this one,
-                # so there is nothing to compute in V(i-1).
-                _h = min(GATE_SPLIT, len(flat) - MFMA_ELEMS_PER_LANE)
-                rocdl.sched_barrier(0)
-                _i0 = [lut_index(x) for x in flat[:_h]]
-                rocdl.sched_barrier(0)
-                _s0 = [lut_load(x) for x in _i0]
-                rocdl.sched_barrier(0)
-                _i1 = [lut_index(x) for x in flat[_h:]]
-                rocdl.sched_barrier(0)
-                _s1 = [lut_load(x) for x in _i1]
-                rocdl.sched_barrier(0)
-                # Consume each half COMPLETELY -- multiply AND pack -- before
-                # touching the other. The second half's 8 `v_perm_b32` then sit
-                # between the first half's reads and the second half's
-                # multiplies, adding another 8 instructions of cover on top of
-                # the address math.
-                _E = MFMA_ELEMS_PER_LANE
-                _pk = []
-                for _half, (_src, _sig, _off) in enumerate(
-                    ((flat[:_h], _s0, 0), (flat[_h:], _s1, _h))
-                ):
+                        if const_expr(apply_mask):
+                            # keep_col is traced and consumed within this same loop iteration
+                            # (see the comprehension below), so the loop vars it closes over are
+                            # bound at definition time -- B023's late-binding concern doesn't apply.
+                            def keep_col(i):
+                                """causal * window * contextual * target mask for (qg, col i)."""
+                                if const_expr(BORDER_MASK):
+                                    return border_keep(col_raw[i], qg)  # noqa: B023
+                                dist = q_row_ids[qg] - col_id[i]  # noqa: B023
+                                if not causal:
+                                    # Non-causal: symmetric id distance |q - col|. With the diagonal
+                                    # term this admits all in-seq columns (full attention); a window
+                                    # then becomes symmetric (|q - col| <= max_attn_len).
+                                    dist = (dist > fx.Int32(0)).select(dist, -dist)
+                                # Diagonal compared in RAW positions (q_rows_i32 == col_raw): a query
+                                # always attends its own token, even where to_id's shift+clamp collapses
+                                # distinct ids. The window/causal distance uses to_id ids, so the id
+                                # transform governs only the off-diagonal mask.
+                                keep = (q_rows_i32[qg] == col_raw[i]) | (  # noqa: B023
+                                    dist > fx.Int32(0)
+                                )
+                                if has_window:
+                                    keep = keep & (dist <= fx.Int32(max_attn_len))
+                                if has_contextual:
+                                    # Prefix opener: logical row 0 attends the contextual prefix.
+                                    ctx = (q_row_ids[qg] == fx.Int32(0)) & (  # noqa: B023
+                                        col_id[i] < max_id  # noqa: B023
+                                    )
+                                    keep = keep | ctx
+                                return keep
+
+                            s_vals = [
+                                keep_col(i).select(s_vals[i], c_zero_f)
+                                for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                            ]
+                        flat.extend(s_vals)
+
+                if const_expr(USE_SIGMA_LUT and GATE_HALVES):
+                    # Split the tile in half and software-pipeline the LUT reads.
+                    #
+                    # Emitted as one block, the 32 reads are issued and then
+                    # consumed: the first `s_waitcnt` covers 18 multiplies and the
+                    # remaining 14 each need their own, 60 cy of waits against a
+                    # `ds_read` measuring 9.50 cy/op.
+                    #
+                    # Interleaving the halves puts the SECOND half's address math
+                    # (3 ops x 16 elements) between the first half's reads and
+                    # their consumers, so those reads get ~48 instructions of cover
+                    # instead of none.
+                    #
+                    # Note the address math CANNOT move a phase earlier: `g` is
+                    # produced by GEMM1 in the M phase immediately before this one,
+                    # so there is nothing to compute in V(i-1).
+                    _h = min(GATE_SPLIT, len(flat) - MFMA_ELEMS_PER_LANE)
                     rocdl.sched_barrier(0)
-                    _g = [_src[k] * _sig[k] for k in range_constexpr(len(_src))]
+                    _i0 = [lut_index(x) for x in flat[:_h]]
                     rocdl.sched_barrier(0)
-                    _pk += [
-                        pack_p(_g[j * _E : (j + 1) * _E])
-                        for j in range_constexpr(len(_src) // _E)
+                    _s0 = [lut_load(x) for x in _i0]
+                    rocdl.sched_barrier(0)
+                    _i1 = [lut_index(x) for x in flat[_h:]]
+                    rocdl.sched_barrier(0)
+                    _s1 = [lut_load(x) for x in _i1]
+                    rocdl.sched_barrier(0)
+                    # Consume each half COMPLETELY -- multiply AND pack -- before
+                    # touching the other. The second half's 8 `v_perm_b32` then sit
+                    # between the first half's reads and the second half's
+                    # multiplies, adding another 8 instructions of cover on top of
+                    # the address math.
+                    _E = MFMA_ELEMS_PER_LANE
+                    _pk = []
+                    for _half, (_src, _sig, _off) in enumerate(
+                        ((flat[:_h], _s0, 0), (flat[_h:], _s1, _h))
+                    ):
+                        rocdl.sched_barrier(0)
+                        _g = [_src[k] * _sig[k] for k in range_constexpr(len(_src))]
+                        rocdl.sched_barrier(0)
+                        _pk += [
+                            pack_p(_g[j * _E : (j + 1) * _E])
+                            for j in range_constexpr(len(_src) // _E)
+                        ]
+                        rocdl.sched_barrier(0)
+                    return [
+                        [
+                            _pk[ng * Q_SUBTILES + qg]
+                            for qg in range_constexpr(Q_SUBTILES)
+                        ]
+                        for ng in range_constexpr(KV_SUBTILES)
                     ]
-                    rocdl.sched_barrier(0)
+                else:
+                    gated = []
+                    for b in range_constexpr(0, len(flat), GATE_BATCH):
+                        gated.extend(silu_scale_batch(flat[b : b + GATE_BATCH]))
+
+                E = MFMA_ELEMS_PER_LANE
                 return [
                     [
-                        _pk[ng * Q_SUBTILES + qg]
+                        pack_p(gated[(ng * Q_SUBTILES + qg) * E :][:E])
                         for qg in range_constexpr(Q_SUBTILES)
                     ]
                     for ng in range_constexpr(KV_SUBTILES)
                 ]
-            else:
-                gated = []
-                for b in range_constexpr(0, len(flat), GATE_BATCH):
-                    gated.extend(silu_scale_batch(flat[b : b + GATE_BATCH]))
 
-            E = MFMA_ELEMS_PER_LANE
-            return [
-                [
-                    pack_p(gated[(ng * Q_SUBTILES + qg) * E :][:E])
-                    for qg in range_constexpr(Q_SUBTILES)
-                ]
-                for ng in range_constexpr(KV_SUBTILES)
-            ]
+            # ==== GEMM2: P*V -> O (V as natural-layout operand B; P as operand A) ====
+            # ==== The two phases ====
+            N_PACK = KV_SUBTILES * Q_SUBTILES
 
-        # ==== GEMM2: P*V -> O (V as natural-layout operand B; P as operand A) ====
-        # ==== The two phases ====
-        N_PACK = KV_SUBTILES * Q_SUBTILES
+            def mfma_phase(
+                o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, g0, masked=False, binit=()
+            ):
+                """PHASE M: both GEMMs, their LDS operand feed, and this group's staging.
 
-        def mfma_phase(
-            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, g0, masked=False, binit=()
-        ):
-            """PHASE M: both GEMMs, their LDS operand feed, and this group's staging.
+                Returns (o_acc, s_accs, kv_regs_next). `u` is the sub-trip position,
+                which is what every LDS slot index is keyed on -- see K_SLOTS.
+                """
+                # Raises this wave above its SIMD partner for the whole MFMA burst.
+                # The pair is wave i / wave i+4, in opposite phases by construction,
+                # and this is what arbitrates them on the shared issue port.
+                rocdl.s_setprio(1)
+                k_cur = u % K_SLOTS
+                k_fill = (u + 1) % K_SLOTS
+                v_cur = u % V_SLOTS
+                v_prev = (u + 1) % V_SLOTS
 
-            Returns (o_acc, s_accs, kv_regs_next). `u` is the sub-trip position,
-            which is what every LDS slot index is keyed on -- see K_SLOTS.
-            """
-            # Raises this wave above its SIMD partner for the whole MFMA burst.
-            # The pair is wave i / wave i+4, in opposite phases by construction,
-            # and this is what arbitrates them on the shared issue port.
-            rocdl.s_setprio(1)
-            k_cur = u % K_SLOTS
-            k_fill = (u + 1) % K_SLOTS
-            v_cur = u % V_SLOTS
-            v_prev = (u + 1) % V_SLOTS
-
-            # STAGING STORES GO FIRST, ahead of the operand burst.
-            #
-            # This was long forbidden here, and for a real reason: `lgkmcnt` is
-            # a single IN-ORDER counter, so a read issued after a store cannot
-            # be known complete until that store retires, whatever buffer each
-            # touches. (There is no DATA hazard -- the write target is the slot
-            # the burst is not reading: k_fill vs k_cur, v_cur vs v_prev. The
-            # coupling is purely through the counter.) Hoisting the store was
-            # built once and measured 137.4 ms against 121.0, a 13.6%
-            # REGRESSION, with all 16 operand reads stuck behind a
-            # bank-conflicted b16 scatter.
-            #
-            # That measurement no longer holds. Re-run against the current
-            # kernel it is a small WIN: 97.30 vs 97.83 ms, -0.5% over two
-            # interleaved pairs. What changed is the duty specialisation
-            # (eb68b017a) -- each arm now carries only its OWN store shape, so
-            # a g0 wave puts 2 `ds_write_b64` in front of the burst instead of
-            # branching around a 10-store block. Two b64 stores are a much
-            # cheaper thing for the counter to retire than the b16 scatter the
-            # original measurement was fighting.
-            #
-            # Keep this under review if the staging shape changes again: the g1
-            # arm still writes 8 b16, and the conclusion is sensitive to that.
-            # One contiguous MFMA burst: GEMM1 of this tile merged with GEMM2
-            # of the previous one. `p_prev` is the previous tile's gate output
-            # and v_smem[v_prev] its V slot -- the rotation. Tiles still land in
-            # the accumulator in ascending order, only one trip later, so this
-            # stays bitwise identical to the unrotated kernel.
-            _N_STORE_K = NUM_BATCHES_KV * (VEC_KV // MFMA_DIM_LANE_K)
-            _N_STORE_V = NUM_BATCHES_KV * VEC_KV
-
-            def _store_k(k):
-                store_k_regs_to_lds(kv_regs, k_smem[k_fill], part=k)
-
-            def _store_v(k):
-                store_v_regs_to_lds(kv_regs, v_smem[v_cur], part=k)
-
-            if const_expr(g0):
-                _ts = (_N_STORE_K, _store_k)
-            else:
-                _ts = (_N_STORE_V, _store_v)
-
-            # BIAS_MASK: this tile's bias tiles arrive in registers, read at the
-            # end of the previous phase V; this phase computes the NEXT tile's
-            # slot rows in its MFMA shadow, for this group's phase V to read.
-            # Computed in place, the ~14 SALU per q-subtile sat in front of the
-            # first MFMA and cost 6%; read here, the first QK MFMA waited ~86
-            # cy on the table at (256,32).
-            _bias = None
-            _side = None
-            if const_expr(masked and BIAS_MASK):
-                _bias = unflatten(list(binit))
-                _pcs, _pst = bias_row_pieces(
-                    lambda: (kv_tile + fx.Int32(1)) * fx.Int32(BLOCK_N)
-                )
-                _side = (BIAS_SIDE_MFMA, _pcs, _pst)
-            o_acc, s_accs, pre_next, brows_next = mfma_burst(
-                o_acc, p_prev, pre, k_smem[k_cur], v_smem[v_prev],
-                tail_store=_ts if const_expr(INTERLEAVE_STORE) else None,
-                bias=_bias,
-                side=_side,
-            )
-            if const_expr(not INTERLEAVE_STORE):
-                rocdl.s_waitcnt(vmcnt=0)
-                if const_expr(g0):
-                    store_k_regs_to_lds(kv_regs, k_smem[k_fill])
-                else:
-                    store_v_regs_to_lds(kv_regs, v_smem[v_cur])
-            rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_KV, 0)
-
-            # Issued now, ds_written in M(i+1), so it targets M(i+1)'s staged
-            # tile: one further out than this phase's, per lane.
-            st_o = stage_advance(st_o)
-            kv_regs_next = async_load_kv_regs(st_o)
-
-            # `phase_barrier` carries no memory fence, so this wait is by hand,
-            # and it must be HERE -- inside the writing phase, not deferred to
-            # the end of phase V. The skew leaves ZERO barriers of slack on two
-            # edges, because the partner is one phase ahead:
-            #
-            #   g0 writes K(i+1) in [B(2i+1), B(2i+2)) and g1 READS it in
-            #     [B(2i+2), ...) -- the very next interval.
-            #   g1 writes V      in [B(2i),   B(2i+1)) and g0's M(i) TAIL
-            #     prefetches it in [B(2i+1), ...) -- likewise.
-            #
-            # `s_barrier` does not retire LDS; `lgkmcnt(0)` before it is what
-            # makes the write visible to the partner. Deferring it measured
-            # 0.6% faster and passed 18 bitwise runs, which is exactly how this
-            # class of bug presents -- the backward's skew race was 0/63 at one
-            # geometry and 36/63 at another.
-            #
-            # The same wait is the WAR edge for this phase's operand ds_reads
-            # against M(i+1)'s writes into those slots; lgkmcnt is one in-order
-            # counter, so one wait does both.
-            #
-            # No `vmcnt` belongs here: the staging load issued just above lands
-            # in REGISTERS, which the partner never reads.
-            rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.s_setprio(0)
-            return o_acc, s_accs, kv_regs_next, st_o, pre_next, brows_next
-
-        def gate_phase(kv_start, s_accs, apply_mask=True, brows=None, binit=()):
-            """PHASE V: the mask and the SiLU gate. No memory operation of its own.
-
-            The LDS drain does NOT live here, though it looks like it should:
-            phase M's writes have zero barriers of slack against the partner's
-            reads, so the wait has to stay inside phase M. See the note there.
-            """
-            if const_expr(apply_mask and BIAS_MASK):
-                # The band is already in s_accs (see BIAS_MASK). Only target
-                # q-blocks, which read the zero slot, are masked here.
-                if const_expr(has_targets):
-                    s_accs = mask_target_blocks(kv_start, s_accs)
-                apply_mask = False
-            p = gate_tile(kv_start, s_accs, apply_mask=apply_mask)
-            if const_expr(brows is not None):
-                # The next tile's GEMM1 initial accumulators. s_accs is dead
-                # by now, and the reads land under the phase barrier.
-                bi = bias_init(brows)
-                binit = [
-                    bi[ng][qg]
-                    for ng in range_constexpr(KV_SUBTILES)
-                    for qg in range_constexpr(Q_SUBTILES)
-                ]
-            return [p[ng][qg] for ng in range_constexpr(KV_SUBTILES) for qg in range_constexpr(Q_SUBTILES)], list(binit)  # fmt: skip
-
-        def unflatten(flat):
-            return [
-                [flat[ng * Q_SUBTILES + qg] for qg in range_constexpr(Q_SUBTILES)]
-                for ng in range_constexpr(KV_SUBTILES)
-            ]
-
-        # Tiles fully below the diagonal are entirely valid under a pure causal mask, so their
-        # per-element mask is pure overhead: split into an unmasked prefix [kv_tile_start, unmasked_end)
-        # and a masked remainder [unmasked_end, n_tiles). With targets, to_id clamps col > max_id to
-        # max_id, so a tile is fully valid only up to min(q_start, max_id) -- the unmasked boundary.
-        CAUSAL_SPLIT = causal and not has_window and not has_contextual
-
-        def split_carry(it):
-            """(o_acc, p_prev, kv_regs) out of one loop's iter_arg tuple.
-
-            `kv_regs` is in there alongside the accumulators because the depth-2
-            staging set issued in the last trip of the unmasked loop is consumed
-            by the first trip of the masked one; left out it would die at the
-            scf.for boundary.
-            """
-            it_list = list(it) if isinstance(it, (list, tuple)) else [it]
-            o = N_ACC + N_PACK              # staged vectors
-            a = o + NUM_BATCHES_KV          # staged voffsets (i32)
-            pre = a + NUM_BATCHES_KV        # cross-phase operand prefetch
-            return (
-                [it_list[i] for i in range_constexpr(N_ACC)],
-                unflatten([it_list[N_ACC + i] for i in range_constexpr(N_PACK)]),
-                [it_list[o + i] for i in range_constexpr(NUM_BATCHES_KV)],
-                [it_list[a + i] for i in range_constexpr(NUM_BATCHES_KV)],
-                [it_list[pre + i] for i in range_constexpr(XPHASE_DEPTH)],
-                [it_list[pre + XPHASE_DEPTH + i] for i in range_constexpr(N_BINIT)],
-            )
-
-        if active:
-            acc_init = [c_zero_v4f32 for _ in range_constexpr(N_ACC)]
-
-            # Prefix/remainder boundary. Non-causal-split -> kv_tile_start (empty prefix range).
-            if const_expr(CAUSAL_SPLIT):
-                split_pos = q_start
-                if has_targets:
-                    split_pos = (q_start < max_id).select(q_start, max_id)
-                unmasked_end = split_pos // fx.Int32(BLOCK_N)
-                unmasked_end = (unmasked_end > kv_tile_start).select(
-                    unmasked_end, kv_tile_start
-                )
-                unmasked_end = (unmasked_end < n_tiles).select(unmasked_end, n_tiles)
-                # Round DOWN to a multiple of UNROLL, relative to kv_tile_start.
-                # Two reasons, and both are correctness, not speed:
-                #  - a padded trip in the MASKED loop is free (every `keep` is
-                #    false, so the gate emits zero packs and the next GEMM2 adds
-                #    nothing), but the unmasked loop has no mask to zero one.
-                #  - slots are keyed on the sub-trip position, so an odd trip
-                #    count here would invert K and V slot parity for the whole
-                #    masked loop.
-                # The tiles handed back to the masked loop are genuinely
-                # unmasked, and the full mask is a no-op on them -- so this is
-                # correct, and costs at most one tile of mask VALU.
-                unmasked_end = kv_tile_start + (
-                    ((unmasked_end - kv_tile_start) // fx.Int32(UNROLL))
-                    * fx.Int32(UNROLL)
-                )
-            else:
-                unmasked_end = kv_tile_start
-
-            # ---- Prologue -----------------------------------------------------
-            # Both groups load tile `first`: g0 needs K(first) for M(first)'s QK
-            # units, g1 needs V(first)'s d-chunk 0 for the rotated bootstrap.
-            # One load serves both, because the base pointer is selected.
-            first = kv_tile_start
-            _t_first = fx.Int32(first) * fx.Int32(BLOCK_N)
-            _boot = async_load_kv_regs(stage_seed(fx.Int32(first) - kv_stage_bump))
-            # M(first) ds_writes the tile `kv_stage_start(first)` names, so prime
-            # the carried staging set with exactly that. Issued right behind the
-            # bootstrap load, and the tables are built under both: at one WG per
-            # CU nothing else hides the prologue, which with a window is ~19% of
-            # the workgroup's time at (256,32) -- the loop is only ~24 tiles.
-            carry_o = stage_seed(fx.Int32(first))
-            carry_regs = async_load_kv_regs(carry_o)
-            if const_expr(USE_SIGMA_LUT):
-                build_sigma_lut()
-            if const_expr(BIAS_MASK):
-                build_bias_table()
-            # Only the bootstrap half: the carried set is first consumed by
-            # M(first)'s staging stores, which wait for it themselves.
-            rocdl.s_waitcnt(vmcnt=NUM_BATCHES_KV)
-            if is_g0:
-                # Nothing inside the loop writes K(first) -- M(i) writes K(i+1).
-                store_k_regs_to_lds(_boot, k_smem[0])
-            else:
-                # THE V BOOTSTRAP. vslot 1 is what M(first) reads, and under the
-                # rotation it must hold d-chunk 0 of tile `first` plus chunks
-                # 1..D-1 of the nonexistent tile `first-1`. Rotated lanes write
-                # the former; every other lane writes ZERO, which supplies the
-                # latter -- so this one store also does the job the explicit
-                # zeroing loop used to, and the loop is gone.
+                # STAGING STORES GO FIRST, ahead of the operand burst.
                 #
-                # That zeroing is not optional: M(first)'s GEMM2 multiplies
-                # P(-1) = 0 against whatever is in those rows, and 0 * NaN is
-                # NaN. LDS is not cleared between workgroups.
-                store_v_regs_to_lds(
-                    [
-                        kv_rot_lane.select(
-                            _boot[b], Vec.filled(VEC_KV, 0.0, elem_dtype).ir_value()
-                        )
-                        for b in range_constexpr(NUM_BATCHES_KV)
-                    ],
-                    v_smem[1],
+                # This was long forbidden here, and for a real reason: `lgkmcnt` is
+                # a single IN-ORDER counter, so a read issued after a store cannot
+                # be known complete until that store retires, whatever buffer each
+                # touches. (There is no DATA hazard -- the write target is the slot
+                # the burst is not reading: k_fill vs k_cur, v_cur vs v_prev. The
+                # coupling is purely through the counter.) Hoisting the store was
+                # built once and measured 137.4 ms against 121.0, a 13.6%
+                # REGRESSION, with all 16 operand reads stuck behind a
+                # bank-conflicted b16 scatter.
+                #
+                # That measurement no longer holds. Re-run against the current
+                # kernel it is a small WIN: 97.30 vs 97.83 ms, -0.5% over two
+                # interleaved pairs. What changed is the duty specialisation
+                # (eb68b017a) -- each arm now carries only its OWN store shape, so
+                # a g0 wave puts 2 `ds_write_b64` in front of the burst instead of
+                # branching around a 10-store block. Two b64 stores are a much
+                # cheaper thing for the counter to retire than the b16 scatter the
+                # original measurement was fighting.
+                #
+                # Keep this under review if the staging shape changes again: the g1
+                # arm still writes 8 b16, and the conclusion is sensitive to that.
+                # One contiguous MFMA burst: GEMM1 of this tile merged with GEMM2
+                # of the previous one. `p_prev` is the previous tile's gate output
+                # and v_smem[v_prev] its V slot -- the rotation. Tiles still land in
+                # the accumulator in ascending order, only one trip later, so this
+                # stays bitwise identical to the unrotated kernel.
+                _N_STORE_K = NUM_BATCHES_KV * (VEC_KV // MFMA_DIM_LANE_K)
+                _N_STORE_V = NUM_BATCHES_KV * VEC_KV
+
+                def _store_k(k):
+                    store_k_regs_to_lds(kv_regs, k_smem[k_fill], part=k)
+
+                def _store_v(k):
+                    store_v_regs_to_lds(kv_regs, v_smem[v_cur], part=k)
+
+                if const_expr(g0):
+                    _ts = (_N_STORE_K, _store_k)
+                else:
+                    _ts = (_N_STORE_V, _store_v)
+
+                # BIAS_MASK: this tile's bias tiles arrive in registers, read at the
+                # end of the previous phase V; this phase computes the NEXT tile's
+                # slot rows in its MFMA shadow, for this group's phase V to read.
+                # Computed in place, the ~14 SALU per q-subtile sat in front of the
+                # first MFMA and cost 6%; read here, the first QK MFMA waited ~86
+                # cy on the table at (256,32).
+                _bias = None
+                _side = None
+                if const_expr(masked and BIAS_MASK):
+                    _bias = unflatten(list(binit))
+                    _pcs, _pst = bias_row_pieces(
+                        lambda: (kv_tile + fx.Int32(1)) * fx.Int32(BLOCK_N)
+                    )
+                    _side = (BIAS_SIDE_MFMA, _pcs, _pst)
+                o_acc, s_accs, pre_next, brows_next = mfma_burst(
+                    o_acc, p_prev, pre, k_smem[k_cur], v_smem[v_prev],
+                    tail_store=_ts if const_expr(INTERLEAVE_STORE) else None,
+                    bias=_bias,
+                    side=_side,
                 )
+                if const_expr(not INTERLEAVE_STORE):
+                    rocdl.s_waitcnt(vmcnt=0)
+                    if const_expr(g0):
+                        store_k_regs_to_lds(kv_regs, k_smem[k_fill])
+                    else:
+                        store_v_regs_to_lds(kv_regs, v_smem[v_cur])
+                rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_KV, 0)
 
-            # The skew: g0 burns one extra barrier so that from here on g0 is in
-            # phase M exactly when g1 is in phase V, and vice versa. Barrier
-            # counts stay equal overall -- g1 repays it after the loops.
-            #
-            # It MUST come BEFORE the publish fence below, not after. Each group
-            # stages only its own tensor (g0 K, g1 V) but trip 0 reads BOTH, so
-            # the fence that publishes them has to be the last thing either group
-            # does before the loop. With the skew after the fence, g1 enters M(0)
-            # a full interval ahead while g0 still sits at the skew barrier, and
-            # g0's trip-0 GEMM2 would read a V tile g1 staged without an
-            # intervening publish. The backward shipped exactly that inversion
-            # and it was nondeterministic at every geometry but its tuned one --
-            # 0/63 runs there against 36/63 at another (fixed in e2a81264d).
-            if is_g0:
-                phase_barrier()
-            rocdl.s_waitcnt(lgkmcnt=0)
-            phase_barrier()
+                # Issued now, ds_written in M(i+1), so it targets M(i+1)'s staged
+                # tile: one further out than this phase's, per lane.
+                st_o = stage_advance(st_o)
+                kv_regs_next = async_load_kv_regs(st_o)
 
-            # M(first)'s PV operates on tile `first-1`, which does not exist, so
-            # its carried chunk-0 packs are zero -- P(-1) is zero too, and
-            # 0 * 0 is exact. From M(first+1) on they come from the tail.
-            pre_init = [c_zero_pack for _ in range_constexpr(XPHASE_DEPTH)]
-            # The masked loop's first tile is unmasked_end (the unmasked prefix is
-            # empty whenever BIAS_MASK is on).
-            binit_init = []
-            if const_expr(BIAS_MASK):
-                _bi = bias_init(bias_rows(unmasked_end * fx.Int32(BLOCK_N)))
-                binit_init = [
-                    _bi[ng][qg]
+                # `phase_barrier` carries no memory fence, so this wait is by hand,
+                # and it must be HERE -- inside the writing phase, not deferred to
+                # the end of phase V. The skew leaves ZERO barriers of slack on two
+                # edges, because the partner is one phase ahead:
+                #
+                #   g0 writes K(i+1) in [B(2i+1), B(2i+2)) and g1 READS it in
+                #     [B(2i+2), ...) -- the very next interval.
+                #   g1 writes V      in [B(2i),   B(2i+1)) and g0's M(i) TAIL
+                #     prefetches it in [B(2i+1), ...) -- likewise.
+                #
+                # `s_barrier` does not retire LDS; `lgkmcnt(0)` before it is what
+                # makes the write visible to the partner. Deferring it measured
+                # 0.6% faster and passed 18 bitwise runs, which is exactly how this
+                # class of bug presents -- the backward's skew race was 0/63 at one
+                # geometry and 36/63 at another.
+                #
+                # The same wait is the WAR edge for this phase's operand ds_reads
+                # against M(i+1)'s writes into those slots; lgkmcnt is one in-order
+                # counter, so one wait does both.
+                #
+                # No `vmcnt` belongs here: the staging load issued just above lands
+                # in REGISTERS, which the partner never reads.
+                rocdl.s_waitcnt(lgkmcnt=0)
+                rocdl.s_setprio(0)
+                return o_acc, s_accs, kv_regs_next, st_o, pre_next, brows_next
+
+            def gate_phase(kv_start, s_accs, apply_mask=True, brows=None, binit=()):
+                """PHASE V: the mask and the SiLU gate. No memory operation of its own.
+
+                The LDS drain does NOT live here, though it looks like it should:
+                phase M's writes have zero barriers of slack against the partner's
+                reads, so the wait has to stay inside phase M. See the note there.
+                """
+                if const_expr(apply_mask and BIAS_MASK):
+                    # The band is already in s_accs (see BIAS_MASK). Only target
+                    # q-blocks, which read the zero slot, are masked here.
+                    if const_expr(has_targets):
+                        s_accs = mask_target_blocks(kv_start, s_accs)
+                    apply_mask = False
+                p = gate_tile(kv_start, s_accs, apply_mask=apply_mask)
+                if const_expr(brows is not None):
+                    # The next tile's GEMM1 initial accumulators. s_accs is dead
+                    # by now, and the reads land under the phase barrier.
+                    bi = bias_init(brows)
+                    binit = [
+                        bi[ng][qg]
+                        for ng in range_constexpr(KV_SUBTILES)
+                        for qg in range_constexpr(Q_SUBTILES)
+                    ]
+                return [p[ng][qg] for ng in range_constexpr(KV_SUBTILES) for qg in range_constexpr(Q_SUBTILES)], list(binit)  # fmt: skip
+
+            def unflatten(flat):
+                return [
+                    [flat[ng * Q_SUBTILES + qg] for qg in range_constexpr(Q_SUBTILES)]
                     for ng in range_constexpr(KV_SUBTILES)
-                    for qg in range_constexpr(Q_SUBTILES)
                 ]
-            carry_init = (
-                acc_init
-                + [c_zero_pack for _ in range_constexpr(N_PACK)]
-                + carry_regs
-                + carry_o
-                + pre_init
-                + binit_init
-            )
 
-            # Trip counts. Both MUST be multiples of UNROLL: slot parity is keyed
-            # on the sub-trip position, so a partial outer trip would hand the
-            # next loop inverted K and V slots.
-            n_unmasked = unmasked_end - fx.Int32(kv_tile_start)
-            # Masked range plus ONE drain trip, so the last real tile's P is
-            # consumed by a GEMM2. A trip past n_tiles has every `keep` false, so
-            # its gate emits zero packs and the following GEMM2 adds nothing --
-            # which also makes the round-up free.
-            n_masked = (
-                (n_tiles + fx.Int32(1) - unmasked_end + fx.Int32(UNROLL - 1))
-                // fx.Int32(UNROLL)
-            ) * fx.Int32(UNROLL)
+            # Tiles fully below the diagonal are entirely valid under a pure causal mask, so their
+            # per-element mask is pure overhead: split into an unmasked prefix [kv_tile_start, unmasked_end)
+            # and a masked remainder [unmasked_end, n_tiles). With targets, to_id clamps col > max_id to
+            # max_id, so a tile is fully valid only up to min(q_start, max_id) -- the unmasked boundary.
+            CAUSAL_SPLIT = causal and not has_window and not has_contextual
 
-            # ---- KV loops + epilogue, SPECIALISED on the staging duty --------
-            # `is_g0` is loop-invariant and wave-uniform, but it was being
-            # re-evaluated inside every phase M to choose K-store vs V-store.
-            # Off the trace that scf.if and its rejoin cost **41 cy per phase
-            # M, 3.3%** (309,004 cy over 7,536 traced phase M executions) --
-            # almost exactly the slack phase M held over phase V.
-            #
-            # The duplication runs to the END of the block, not just the loops,
-            # so nothing has to escape the `if`: FlyDSL's loop protocol is built
-            # on `yield`, which rules out a helper function (it would become a
-            # Python generator), and the carried set is ~60 values, which is not
-            # something to hand to an scf.if result list.
-            #
-            # Barrier counts are identical in both arms -- they differ only in
-            # which LDS tensor they store -- so the ping-pong skew is intact.
-            if is_g0:
-                loop_results = carry_init
-                # ---- Unmasked prefix (empty unless CAUSAL_SPLIT) ----
-                for _o0, it in range(
-                    fx.Int32(0),
-                    n_unmasked // fx.Int32(UNROLL),
-                    fx.Int32(1),
-                    init=carry_init,
-                ):  # ty: ignore
-                    o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
-                    base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
-                    for u in range_constexpr(UNROLL):
-                        # Loop rotated: the closing barrier of each gate phase is
-                        # issued at the TOP of the next sub-trip rather than the
-                        # bottom of this one, so the scf.for back edge -- increment,
-                        # trip compare, branch -- lands in the tail of the gate phase
-                        # instead of at the head of the MFMA phase, where it would
-                        # sit in front of the burst.
-                        if const_expr(u == 0):
-                            phase_barrier()
-                        kv_tile = base + fx.Int32(u)
-                        o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True, binit=binit,
-                        )
-                        phase_barrier()
-                        p_flat, binit = gate_phase(
-                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False,
-                            brows=brows, binit=binit,
-                        )
-                        p_prev = unflatten(p_flat)
-                        if const_expr(u < UNROLL - 1):
-                            phase_barrier()
-                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
+            def split_carry(it):
+                """(o_acc, p_prev, kv_regs) out of one loop's iter_arg tuple.
 
-                # ---- Masked remainder + drain ----
-                for _o1, it in range(
-                    fx.Int32(0),
-                    n_masked // fx.Int32(UNROLL),
-                    fx.Int32(1),
-                    init=loop_results,
-                ):  # ty: ignore
-                    o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
-                    base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
-                    for u in range_constexpr(UNROLL):
-                        # Loop rotated: the closing barrier of each gate phase is
-                        # issued at the TOP of the next sub-trip rather than the
-                        # bottom of this one, so the scf.for back edge -- increment,
-                        # trip compare, branch -- lands in the tail of the gate phase
-                        # instead of at the head of the MFMA phase, where it would
-                        # sit in front of the burst.
-                        if const_expr(u == 0):
-                            phase_barrier()
-                        kv_tile = base + fx.Int32(u)
-                        o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True, masked=True, binit=binit,
-                        )
-                        phase_barrier()
-                        p_flat, binit = gate_phase(
-                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True,
-                            brows=brows, binit=binit,
-                        )
-                        p_prev = unflatten(p_flat)
-                        if const_expr(u < UNROLL - 1):
-                            phase_barrier()
-                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
+                `kv_regs` is in there alongside the accumulators because the depth-2
+                staging set issued in the last trip of the unmasked loop is consumed
+                by the first trip of the masked one; left out it would die at the
+                scf.for boundary.
+                """
+                it_list = list(it) if isinstance(it, (list, tuple)) else [it]
+                o = N_ACC + N_PACK              # staged vectors
+                a = o + NUM_BATCHES_KV          # staged voffsets (i32)
+                pre = a + NUM_BATCHES_KV        # cross-phase operand prefetch
+                return (
+                    [it_list[i] for i in range_constexpr(N_ACC)],
+                    unflatten([it_list[N_ACC + i] for i in range_constexpr(N_PACK)]),
+                    [it_list[o + i] for i in range_constexpr(NUM_BATCHES_KV)],
+                    [it_list[a + i] for i in range_constexpr(NUM_BATCHES_KV)],
+                    [it_list[pre + i] for i in range_constexpr(XPHASE_DEPTH)],
+                    [it_list[pre + XPHASE_DEPTH + i] for i in range_constexpr(N_BINIT)],
+                )
 
-                # Closes the last sub-trip's gate phase, which the rotation left
-                # without a trailing barrier inside the loop.
+            if active:
+                acc_init = [c_zero_v4f32 for _ in range_constexpr(N_ACC)]
+
+                # Prefix/remainder boundary. Non-causal-split -> kv_tile_start (empty prefix range).
+                if const_expr(CAUSAL_SPLIT):
+                    split_pos = q_start
+                    if has_targets:
+                        split_pos = (q_start < max_id).select(q_start, max_id)
+                    unmasked_end = split_pos // fx.Int32(BLOCK_N)
+                    unmasked_end = (unmasked_end > kv_tile_start).select(
+                        unmasked_end, kv_tile_start
+                    )
+                    unmasked_end = (unmasked_end < n_tiles).select(unmasked_end, n_tiles)
+                    # Round DOWN to a multiple of UNROLL, relative to kv_tile_start.
+                    # Two reasons, and both are correctness, not speed:
+                    #  - a padded trip in the MASKED loop is free (every `keep` is
+                    #    false, so the gate emits zero packs and the next GEMM2 adds
+                    #    nothing), but the unmasked loop has no mask to zero one.
+                    #  - slots are keyed on the sub-trip position, so an odd trip
+                    #    count here would invert K and V slot parity for the whole
+                    #    masked loop.
+                    # The tiles handed back to the masked loop are genuinely
+                    # unmasked, and the full mask is a no-op on them -- so this is
+                    # correct, and costs at most one tile of mask VALU.
+                    unmasked_end = kv_tile_start + (
+                        ((unmasked_end - kv_tile_start) // fx.Int32(UNROLL))
+                        * fx.Int32(UNROLL)
+                    )
+                else:
+                    unmasked_end = kv_tile_start
+
+                # ---- Prologue -----------------------------------------------------
+                # Both groups load tile `first`: g0 needs K(first) for M(first)'s QK
+                # units, g1 needs V(first)'s d-chunk 0 for the rotated bootstrap.
+                # One load serves both, because the base pointer is selected.
+                first = kv_tile_start
+                _t_first = fx.Int32(first) * fx.Int32(BLOCK_N)
+                _boot = async_load_kv_regs(stage_seed(fx.Int32(first) - kv_stage_bump))
+                # M(first) ds_writes the tile `kv_stage_start(first)` names, so prime
+                # the carried staging set with exactly that. Issued right behind the
+                # bootstrap load, and the tables are built under both: at one WG per
+                # CU nothing else hides the prologue, which with a window is ~19% of
+                # the workgroup's time at (256,32) -- the loop is only ~24 tiles.
+                carry_o = stage_seed(fx.Int32(first))
+                carry_regs = async_load_kv_regs(carry_o)
+                # Once per workgroup: both tables are read-only afterwards.
+                if first_qt:
+                    if const_expr(USE_SIGMA_LUT):
+                        build_sigma_lut()
+                    if const_expr(BIAS_MASK):
+                        build_bias_table()
+                # Only the bootstrap half: the carried set is first consumed by
+                # M(first)'s staging stores, which wait for it themselves.
+                rocdl.s_waitcnt(vmcnt=NUM_BATCHES_KV)
+                if is_g0:
+                    # Nothing inside the loop writes K(first) -- M(i) writes K(i+1).
+                    store_k_regs_to_lds(_boot, k_smem[0])
+                else:
+                    # THE V BOOTSTRAP. vslot 1 is what M(first) reads, and under the
+                    # rotation it must hold d-chunk 0 of tile `first` plus chunks
+                    # 1..D-1 of the nonexistent tile `first-1`. Rotated lanes write
+                    # the former; every other lane writes ZERO, which supplies the
+                    # latter -- so this one store also does the job the explicit
+                    # zeroing loop used to, and the loop is gone.
+                    #
+                    # That zeroing is not optional: M(first)'s GEMM2 multiplies
+                    # P(-1) = 0 against whatever is in those rows, and 0 * NaN is
+                    # NaN. LDS is not cleared between workgroups.
+                    store_v_regs_to_lds(
+                        [
+                            kv_rot_lane.select(
+                                _boot[b], Vec.filled(VEC_KV, 0.0, elem_dtype).ir_value()
+                            )
+                            for b in range_constexpr(NUM_BATCHES_KV)
+                        ],
+                        v_smem[1],
+                    )
+
+                # The skew: g0 burns one extra barrier so that from here on g0 is in
+                # phase M exactly when g1 is in phase V, and vice versa. Barrier
+                # counts stay equal overall -- g1 repays it after the loops.
+                #
+                # It MUST come BEFORE the publish fence below, not after. Each group
+                # stages only its own tensor (g0 K, g1 V) but trip 0 reads BOTH, so
+                # the fence that publishes them has to be the last thing either group
+                # does before the loop. With the skew after the fence, g1 enters M(0)
+                # a full interval ahead while g0 still sits at the skew barrier, and
+                # g0's trip-0 GEMM2 would read a V tile g1 staged without an
+                # intervening publish. The backward shipped exactly that inversion
+                # and it was nondeterministic at every geometry but its tuned one --
+                # 0/63 runs there against 36/63 at another (fixed in e2a81264d).
+                if is_g0:
+                    phase_barrier()
+                rocdl.s_waitcnt(lgkmcnt=0)
                 phase_barrier()
 
-                # g1 repays the skew barrier so both groups leave with equal counts.
-                if not is_g0:
+                # M(first)'s PV operates on tile `first-1`, which does not exist, so
+                # its carried chunk-0 packs are zero -- P(-1) is zero too, and
+                # 0 * 0 is exact. From M(first+1) on they come from the tail.
+                pre_init = [c_zero_pack for _ in range_constexpr(XPHASE_DEPTH)]
+                # The masked loop's first tile is unmasked_end (the unmasked prefix is
+                # empty whenever BIAS_MASK is on).
+                binit_init = []
+                if const_expr(BIAS_MASK):
+                    _bi = bias_init(bias_rows(unmasked_end * fx.Int32(BLOCK_N)))
+                    binit_init = [
+                        _bi[ng][qg]
+                        for ng in range_constexpr(KV_SUBTILES)
+                        for qg in range_constexpr(Q_SUBTILES)
+                    ]
+                carry_init = (
+                    acc_init
+                    + [c_zero_pack for _ in range_constexpr(N_PACK)]
+                    + carry_regs
+                    + carry_o
+                    + pre_init
+                    + binit_init
+                )
+
+                # Trip counts. Both MUST be multiples of UNROLL: slot parity is keyed
+                # on the sub-trip position, so a partial outer trip would hand the
+                # next loop inverted K and V slots.
+                n_unmasked = unmasked_end - fx.Int32(kv_tile_start)
+                # Masked range plus ONE drain trip, so the last real tile's P is
+                # consumed by a GEMM2. A trip past n_tiles has every `keep` false, so
+                # its gate emits zero packs and the following GEMM2 adds nothing --
+                # which also makes the round-up free.
+                n_masked = (
+                    (n_tiles + fx.Int32(1) - unmasked_end + fx.Int32(UNROLL - 1))
+                    // fx.Int32(UNROLL)
+                ) * fx.Int32(UNROLL)
+
+                # ---- KV loops + epilogue, SPECIALISED on the staging duty --------
+                # `is_g0` is loop-invariant and wave-uniform, but it was being
+                # re-evaluated inside every phase M to choose K-store vs V-store.
+                # Off the trace that scf.if and its rejoin cost **41 cy per phase
+                # M, 3.3%** (309,004 cy over 7,536 traced phase M executions) --
+                # almost exactly the slack phase M held over phase V.
+                #
+                # The duplication runs to the END of the block, not just the loops,
+                # so nothing has to escape the `if`: FlyDSL's loop protocol is built
+                # on `yield`, which rules out a helper function (it would become a
+                # Python generator), and the carried set is ~60 values, which is not
+                # something to hand to an scf.if result list.
+                #
+                # Barrier counts are identical in both arms -- they differ only in
+                # which LDS tensor they store -- so the ping-pong skew is intact.
+                if is_g0:
+                    loop_results = carry_init
+                    # ---- Unmasked prefix (empty unless CAUSAL_SPLIT) ----
+                    for _o0, it in range(
+                        fx.Int32(0),
+                        n_unmasked // fx.Int32(UNROLL),
+                        fx.Int32(1),
+                        init=carry_init,
+                    ):  # ty: ignore
+                        o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
+                        base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
+                        for u in range_constexpr(UNROLL):
+                            # Loop rotated: the closing barrier of each gate phase is
+                            # issued at the TOP of the next sub-trip rather than the
+                            # bottom of this one, so the scf.for back edge -- increment,
+                            # trip compare, branch -- lands in the tail of the gate phase
+                            # instead of at the head of the MFMA phase, where it would
+                            # sit in front of the burst.
+                            if const_expr(u == 0):
+                                phase_barrier()
+                            kv_tile = base + fx.Int32(u)
+                            o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
+                                o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True, binit=binit,
+                            )
+                            phase_barrier()
+                            p_flat, binit = gate_phase(
+                                kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False,
+                                brows=brows, binit=binit,
+                            )
+                            p_prev = unflatten(p_flat)
+                            if const_expr(u < UNROLL - 1):
+                                phase_barrier()
+                        loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
+
+                    # ---- Masked remainder + drain ----
+                    for _o1, it in range(
+                        fx.Int32(0),
+                        n_masked // fx.Int32(UNROLL),
+                        fx.Int32(1),
+                        init=loop_results,
+                    ):  # ty: ignore
+                        o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
+                        base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
+                        for u in range_constexpr(UNROLL):
+                            # Loop rotated: the closing barrier of each gate phase is
+                            # issued at the TOP of the next sub-trip rather than the
+                            # bottom of this one, so the scf.for back edge -- increment,
+                            # trip compare, branch -- lands in the tail of the gate phase
+                            # instead of at the head of the MFMA phase, where it would
+                            # sit in front of the burst.
+                            if const_expr(u == 0):
+                                phase_barrier()
+                            kv_tile = base + fx.Int32(u)
+                            o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
+                                o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, True, masked=True, binit=binit,
+                            )
+                            phase_barrier()
+                            p_flat, binit = gate_phase(
+                                kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True,
+                                brows=brows, binit=binit,
+                            )
+                            p_prev = unflatten(p_flat)
+                            if const_expr(u < UNROLL - 1):
+                                phase_barrier()
+                        loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
+
+                    # Closes the last sub-trip's gate phase, which the rotation left
+                    # without a trailing barrier inside the loop.
                     phase_barrier()
 
-                # ---- Epilogue: store O (1/N hoisted here) ----
-                # GEMM2 writes a transposed C fragment: A=P, B=V, C[d, query].
-                # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
-                # therefore q_blk_base(qg) + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
-                results = (
-                    list(loop_results)
-                    if isinstance(loop_results, (list, tuple))
-                    else [loop_results]
-                )
-                for qg in range_constexpr(Q_SUBTILES):
-                    q_row_base = q_blk_base(qg) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                    for e in range_constexpr(MFMA_ELEMS_PER_LANE):
-                        q_row_e = q_row_base + fx.Int32(e)
-                        if q_row_e < seq_len:
-                            for c in range_constexpr(D_CHUNKS):
-                                ov = results[c * Q_SUBTILES + qg]
-                                d_col = fx.Int32(c * MFMA_M) + lane_mod_16
-                                val = (Vec(ov)[e] * inv_n).to(elem_dtype)
-                                out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
-            else:
-                loop_results = carry_init
-                # ---- Unmasked prefix (empty unless CAUSAL_SPLIT) ----
-                for _o0, it in range(
-                    fx.Int32(0),
-                    n_unmasked // fx.Int32(UNROLL),
-                    fx.Int32(1),
-                    init=carry_init,
-                ):  # ty: ignore
-                    o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
-                    base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
-                    for u in range_constexpr(UNROLL):
-                        # Loop rotated: the closing barrier of each gate phase is
-                        # issued at the TOP of the next sub-trip rather than the
-                        # bottom of this one, so the scf.for back edge -- increment,
-                        # trip compare, branch -- lands in the tail of the gate phase
-                        # instead of at the head of the MFMA phase, where it would
-                        # sit in front of the burst.
-                        if const_expr(u == 0):
-                            phase_barrier()
-                        kv_tile = base + fx.Int32(u)
-                        o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False, binit=binit,
-                        )
+                    # g1 repays the skew barrier so both groups leave with equal counts.
+                    if not is_g0:
                         phase_barrier()
-                        p_flat, binit = gate_phase(
-                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False,
-                            brows=brows, binit=binit,
-                        )
-                        p_prev = unflatten(p_flat)
-                        if const_expr(u < UNROLL - 1):
-                            phase_barrier()
-                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
 
-                # ---- Masked remainder + drain ----
-                for _o1, it in range(
-                    fx.Int32(0),
-                    n_masked // fx.Int32(UNROLL),
-                    fx.Int32(1),
-                    init=loop_results,
-                ):  # ty: ignore
-                    o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
-                    base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
-                    for u in range_constexpr(UNROLL):
-                        # Loop rotated: the closing barrier of each gate phase is
-                        # issued at the TOP of the next sub-trip rather than the
-                        # bottom of this one, so the scf.for back edge -- increment,
-                        # trip compare, branch -- lands in the tail of the gate phase
-                        # instead of at the head of the MFMA phase, where it would
-                        # sit in front of the burst.
-                        if const_expr(u == 0):
+                    # ---- Epilogue: store O (1/N hoisted here) ----
+                    # GEMM2 writes a transposed C fragment: A=P, B=V, C[d, query].
+                    # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
+                    # therefore q_blk_base(qg) + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
+                    results = (
+                        list(loop_results)
+                        if isinstance(loop_results, (list, tuple))
+                        else [loop_results]
+                    )
+                    for qg in range_constexpr(Q_SUBTILES):
+                        q_row_base = q_blk_base(qg) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                        for e in range_constexpr(MFMA_ELEMS_PER_LANE):
+                            q_row_e = q_row_base + fx.Int32(e)
+                            if q_row_e < seq_len:
+                                for c in range_constexpr(D_CHUNKS):
+                                    ov = results[c * Q_SUBTILES + qg]
+                                    d_col = fx.Int32(c * MFMA_M) + lane_mod_16
+                                    val = (Vec(ov)[e] * inv_n).to(elem_dtype)
+                                    out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
+                else:
+                    loop_results = carry_init
+                    # ---- Unmasked prefix (empty unless CAUSAL_SPLIT) ----
+                    for _o0, it in range(
+                        fx.Int32(0),
+                        n_unmasked // fx.Int32(UNROLL),
+                        fx.Int32(1),
+                        init=carry_init,
+                    ):  # ty: ignore
+                        o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
+                        base = fx.Int32(kv_tile_start) + fx.Int32(_o0) * fx.Int32(UNROLL)
+                        for u in range_constexpr(UNROLL):
+                            # Loop rotated: the closing barrier of each gate phase is
+                            # issued at the TOP of the next sub-trip rather than the
+                            # bottom of this one, so the scf.for back edge -- increment,
+                            # trip compare, branch -- lands in the tail of the gate phase
+                            # instead of at the head of the MFMA phase, where it would
+                            # sit in front of the burst.
+                            if const_expr(u == 0):
+                                phase_barrier()
+                            kv_tile = base + fx.Int32(u)
+                            o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
+                                o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False, binit=binit,
+                            )
                             phase_barrier()
-                        kv_tile = base + fx.Int32(u)
-                        o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
-                            o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False, masked=True, binit=binit,
-                        )
-                        phase_barrier()
-                        p_flat, binit = gate_phase(
-                            kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True,
-                            brows=brows, binit=binit,
-                        )
-                        p_prev = unflatten(p_flat)
-                        if const_expr(u < UNROLL - 1):
+                            p_flat, binit = gate_phase(
+                                kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=False,
+                                brows=brows, binit=binit,
+                            )
+                            p_prev = unflatten(p_flat)
+                            if const_expr(u < UNROLL - 1):
+                                phase_barrier()
+                        loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
+
+                    # ---- Masked remainder + drain ----
+                    for _o1, it in range(
+                        fx.Int32(0),
+                        n_masked // fx.Int32(UNROLL),
+                        fx.Int32(1),
+                        init=loop_results,
+                    ):  # ty: ignore
+                        o_acc, p_prev, kv_regs, st_o, pre, binit = split_carry(it)
+                        base = unmasked_end + fx.Int32(_o1) * fx.Int32(UNROLL)
+                        for u in range_constexpr(UNROLL):
+                            # Loop rotated: the closing barrier of each gate phase is
+                            # issued at the TOP of the next sub-trip rather than the
+                            # bottom of this one, so the scf.for back edge -- increment,
+                            # trip compare, branch -- lands in the tail of the gate phase
+                            # instead of at the head of the MFMA phase, where it would
+                            # sit in front of the burst.
+                            if const_expr(u == 0):
+                                phase_barrier()
+                            kv_tile = base + fx.Int32(u)
+                            o_acc, s_accs, kv_regs, st_o, pre, brows = mfma_phase(
+                                o_acc, p_prev, kv_regs, st_o, pre, kv_tile, u, False, masked=True, binit=binit,
+                            )
                             phase_barrier()
-                    loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
+                            p_flat, binit = gate_phase(
+                                kv_tile * fx.Int32(BLOCK_N), s_accs, apply_mask=True,
+                                brows=brows, binit=binit,
+                            )
+                            p_prev = unflatten(p_flat)
+                            if const_expr(u < UNROLL - 1):
+                                phase_barrier()
+                        loop_results = yield (o_acc + p_flat + kv_regs + st_o + pre + binit)
 
-                # Closes the last sub-trip's gate phase, which the rotation left
-                # without a trailing barrier inside the loop.
-                phase_barrier()
-
-                # g1 repays the skew barrier so both groups leave with equal counts.
-                if not is_g0:
+                    # Closes the last sub-trip's gate phase, which the rotation left
+                    # without a trailing barrier inside the loop.
                     phase_barrier()
 
-                # ---- Epilogue: store O (1/N hoisted here) ----
-                # GEMM2 writes a transposed C fragment: A=P, B=V, C[d, query].
-                # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
-                # therefore q_blk_base(qg) + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
-                results = (
-                    list(loop_results)
-                    if isinstance(loop_results, (list, tuple))
-                    else [loop_results]
-                )
-                for qg in range_constexpr(Q_SUBTILES):
-                    q_row_base = q_blk_base(qg) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                    for e in range_constexpr(MFMA_ELEMS_PER_LANE):
-                        q_row_e = q_row_base + fx.Int32(e)
-                        if q_row_e < seq_len:
-                            for c in range_constexpr(D_CHUNKS):
-                                ov = results[c * Q_SUBTILES + qg]
-                                d_col = fx.Int32(c * MFMA_M) + lane_mod_16
-                                val = (Vec(ov)[e] * inv_n).to(elem_dtype)
-                                out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
+                    # g1 repays the skew barrier so both groups leave with equal counts.
+                    if not is_g0:
+                        phase_barrier()
+
+                    # ---- Epilogue: store O (1/N hoisted here) ----
+                    # GEMM2 writes a transposed C fragment: A=P, B=V, C[d, query].
+                    # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
+                    # therefore q_blk_base(qg) + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
+                    results = (
+                        list(loop_results)
+                        if isinstance(loop_results, (list, tuple))
+                        else [loop_results]
+                    )
+                    for qg in range_constexpr(Q_SUBTILES):
+                        q_row_base = q_blk_base(qg) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                        for e in range_constexpr(MFMA_ELEMS_PER_LANE):
+                            q_row_e = q_row_base + fx.Int32(e)
+                            if q_row_e < seq_len:
+                                for c in range_constexpr(D_CHUNKS):
+                                    ov = results[c * Q_SUBTILES + qg]
+                                    d_col = fx.Int32(c * MFMA_M) + lane_mod_16
+                                    val = (Vec(ov)[e] * inv_n).to(elem_dtype)
+                                    out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
 
     _hstu_compile_hints = {
         "fast_fp_math": True,
@@ -2580,7 +2598,10 @@ def build_hstu_attention_fwd_pp(
         num_q_tiles = (max_seq_len + fx.Int32(BLOCK_M - 1)) // fx.Int32(BLOCK_M)
         hz_total = batch * c_num_heads
         hz_per_group = (hz_total + fx.Int32(NUM_GRID_GROUPS - 1)) // c_ngg
-        grid_blocks = num_q_tiles * hz_per_group * c_ngg
+        num_q_groups = (num_q_tiles + fx.Int32(Q_TILES_PER_WG - 1)) // fx.Int32(
+            Q_TILES_PER_WG
+        )
+        grid_blocks = num_q_groups * hz_per_group * c_ngg
 
         # Epilogue scale = (1/N)*(-1/log2e): the -1/log2e undoes silu_scale_batch's -log2e base-change
         # (alpha stays inside silu), 1/N normalizes by the global max_seq_len (N), not the row's seq_len.
@@ -2593,7 +2614,7 @@ def build_hstu_attention_fwd_pp(
             seq_offsets,
             num_targets,
             out,
-            num_q_tiles,
+            num_q_groups,
             hz_per_group,
             hz_total,
             inv_n,
