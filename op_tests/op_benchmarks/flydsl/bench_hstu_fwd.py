@@ -5,8 +5,9 @@
 
 Three providers, all run on the same tensors and the same seeded jagged lengths:
 
-  ``pingpong``  the FlyDSL ping-pong forward at one fixed geometry (--pp-tile,
-                default 512,32 -> BLOCK_M=512, BLOCK_N=32, 8 waves, 2 waves/EU).
+  ``pingpong``  the FlyDSL ping-pong forward, by default at the geometry its
+                dispatcher picks for the mask (hstu: 512,32; windowed: 256,32;
+                8 waves, 2 waves/EU). --pp-tile pins one BLOCK_M,BLOCK_N for all.
   ``flydsl``    the shipping FlyDSL forward, at the tile its tuned CSV selects.
   ``ck``        the CK-tile forward binary (tile_example_hstu_attention_fwd).
 
@@ -66,7 +67,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.ops.flydsl.hstu_attention import flydsl_hstu_attention_fwd
+from aiter.ops.flydsl.hstu_attention import flydsl_hstu_attention_fwd, fwd_pp_tiles
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd_pp import (
     build_hstu_attention_fwd_pp,
 )
@@ -188,12 +189,13 @@ def bench_cell(mask, regime, b, h, target_size, providers, reps, pp_tile):
     if "flydsl" in providers:
         launch["flydsl"] = lambda: flydsl_hstu_attention_fwd(*fwd_args)
     if "pingpong" in providers:
-        bm, bn = pp_tile
+        tiles = fwd_pp_tiles(max_attn_len)
+        if pp_tile is not None:
+            tiles["block_m"], tiles["block_n"] = pp_tile
         pp = build_hstu_attention_fwd_pp(
             num_heads=h, head_dim=HEAD_DIM, hidden_dim=HEAD_DIM, causal=True,
             max_attn_len=max_attn_len, contextual_seq_len=0, has_targets=True,
-            alpha=ALPHA, dtype_str="bf16",
-            block_m=bm, block_n=bn, num_waves=8, waves_per_eu=2,
+            alpha=ALPHA, dtype_str="bf16", **tiles,
         )  # fmt: skip
         launch["pingpong"] = lambda: pp(
             SEQ_LEN, b, q, k, v, offsets, num_targets, out, stream
@@ -300,8 +302,10 @@ def parse_args():
         median over passes. Default 1.""",
     )  # fmt: skip
     parser.add_argument(
-        "--pp-tile", default="512,32",
-        help="""Ping-pong BLOCK_M,BLOCK_N. Default 512,32 is the shipped ping-pong geometry.""",
+        "--pp-tile", default=None,
+        help="""Ping-pong BLOCK_M,BLOCK_N for every mask. Default: the dispatcher's
+        geometry per mask -- 512,32 for hstu, 256,32 for windowed (a taller tile
+        sweeps more out-of-window KV under a window).""",
     )  # fmt: skip
     parser.add_argument(
         "-o", type=str, default=None,
@@ -330,7 +334,7 @@ def main():
 
     # The shipping arm must not pick up the ping-pong path from the environment.
     os.environ.pop("AITER_HSTU_FWD_PINGPONG", None)
-    pp_tile = tuple(int(x) for x in args.pp_tile.split(","))
+    pp_tile = tuple(int(x) for x in args.pp_tile.split(",")) if args.pp_tile else None
 
     cells = [
         (m, *c)

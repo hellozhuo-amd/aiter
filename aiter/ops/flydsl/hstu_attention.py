@@ -279,6 +279,11 @@ _FWD_PP_TILES = {
 _FWD_PP_TILES_WINDOWED = {**_FWD_PP_TILES, "block_m": 256}
 
 
+def fwd_pp_tiles(max_attn_len: int) -> dict:
+    """The ping-pong forward's default geometry for a mask (benchmarks use it too)."""
+    return dict(_FWD_PP_TILES_WINDOWED if max_attn_len > 0 else _FWD_PP_TILES)
+
+
 def _fwd_pp_requested() -> bool:
     """AITER_HSTU_FWD_PINGPONG, read OUTSIDE the lru_cache.
 
@@ -307,8 +312,7 @@ def _fwd_pp_launcher(
     if not explicit and not pp_env:
         return None
 
-    tiles = _FWD_PP_TILES_WINDOWED if kwargs.get("max_attn_len", 0) > 0 else _FWD_PP_TILES
-    config = {**tiles, **custom_config}
+    config = {**fwd_pp_tiles(kwargs.get("max_attn_len", 0)), **custom_config}
     pp_kwargs = {**kwargs, **config}
     try:
         validate_hstu_attention_fwd_pp(**pp_kwargs)
