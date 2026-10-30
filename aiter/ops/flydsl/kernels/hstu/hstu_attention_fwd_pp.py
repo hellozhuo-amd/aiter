@@ -584,7 +584,7 @@ def build_hstu_attention_fwd_pp(
     # per KV tile is ~70 KB at (512,32), W=512) and computing the mask in the
     # loop costs at least one VALU per score, ~7% of the kernel by this
     # kernel's calibration. Translation invariance is what makes the table
-    # small: N_BSLOT * KV_SUBTILES KB, 14 KB at W=512.
+    # small: N_BSLOT * KV_SUBTILES KB, 16 KB at W=512 (8 slots incl. the zero one).
     #
     # The per-tile cost: phase M(i) computes the slot rows for tile i+1 in
     # SALU, three ops per MFMA shadow (in place, in front of the burst, they
