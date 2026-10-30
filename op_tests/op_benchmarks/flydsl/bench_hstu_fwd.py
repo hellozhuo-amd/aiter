@@ -13,7 +13,8 @@ Three providers, all run on the same tensors and the same seeded jagged lengths:
 
 Protocol (SILOTIGER-1337): production ``hstu`` mask -- causal with the target
 diagonal, max_attn_len=0, contextual_seq_len=0 -- plus a ``windowed`` mask that
-is the same but with max_attn_len=512 (CK: -local_len=512). Sparsity 0.95, bf16, N=16384,
+is the same but with max_attn_len=W (CK: -local_len=W), W=512 unless --window
+lists other sizes. Sparsity 0.95, bf16, N=16384,
 d_qk=d_v=64, targets 10 for Training and 300 for Inference. One pass is 3
 warmup launches then 11 timed launches. The cell reports the median over
 ``--reps`` passes (default 3), with the passes interleaved across providers so
@@ -36,6 +37,10 @@ Usage (from the repo root, so the ``op_tests`` import resolves):
 
     # Windowed mask (max_attn_len=512) only
     python -m op_tests.op_benchmarks.flydsl.bench_hstu_fwd --mask windowed
+
+    # Windowed mask, sweeping the window size
+    python -m op_tests.op_benchmarks.flydsl.bench_hstu_fwd --mask windowed \
+        --window 32 64 128 256 512 1024 2048 4096 --no-ck
 
     # Inference cells only, FlyDSL arms only
     python -m op_tests.op_benchmarks.flydsl.bench_hstu_fwd --regime Inference --provider pingpong flydsl
@@ -95,7 +100,8 @@ ALPHA = 1.0 / HEAD_DIM * 10000
 WARMUP = 3
 ITERS = 11
 
-# mask name -> max_attn_len (0 = no window).
+# mask name -> default max_attn_len (0 = no window). --window overrides the
+# windowed mask's size, and may list several.
 MASKS = {"hstu": 0, "windowed": 512}
 
 # (regime, batch, heads, target_size). Regime names are the ticket's; both are
@@ -176,13 +182,12 @@ def run_ck(b, h, lengths, num_targets, max_attn_len) -> float:
     return float(match.group(1))
 
 
-def bench_cell(mask, regime, b, h, target_size, providers, reps, pp_tile):
+def bench_cell(mask, max_attn_len, regime, b, h, target_size, providers, reps, pp_tile):
     """Time the selected providers on one cell. Returns one row per provider."""
     q, k, v, offsets, num_targets, lengths = make_inputs(b, h, target_size)
     total = int(offsets[-1].item())
     out = torch.empty_like(v)
     stream = torch.cuda.current_stream(q.device)
-    max_attn_len = MASKS[mask]
     fwd_args = (SEQ_LEN, ALPHA, q, k, v, offsets, True, num_targets, max_attn_len, 0)
 
     launch = {}
@@ -278,8 +283,15 @@ def parse_args():
     )  # fmt: skip
     parser.add_argument(
         "--mask", nargs="*", default=list(MASKS), choices=list(MASKS),
-        help="""Masks to run: hstu (max_attn_len=0) and/or windowed (max_attn_len=512).
+        help="""Masks to run: hstu (max_attn_len=0) and/or windowed (max_attn_len=512,
+        or the sizes given by --window).
         e.g.: --mask windowed""",
+    )  # fmt: skip
+    parser.add_argument(
+        "--window", type=int, nargs="+", default=[MASKS["windowed"]],
+        help="""max_attn_len values for the windowed mask; each one is a full set
+        of cells. Default 512.
+        e.g.: --window 32 64 128 256 512 1024 2048 4096""",
     )  # fmt: skip
     parser.add_argument(
         "--no-ck", action="store_true",
@@ -336,20 +348,27 @@ def main():
     os.environ.pop("AITER_HSTU_FWD_PINGPONG", None)
     pp_tile = tuple(int(x) for x in args.pp_tile.split(",")) if args.pp_tile else None
 
+    # (label, max_attn_len) per mask instance; a swept window gets one per size.
+    masks = []
+    if "hstu" in args.mask:
+        masks.append(("hstu", MASKS["hstu"]))
+    if "windowed" in args.mask:
+        sweep = args.window != [MASKS["windowed"]]
+        masks += [(f"windowed W={w}" if sweep else "windowed", w) for w in args.window]
     cells = [
-        (m, *c)
-        for m in MASKS
-        if m in args.mask
+        (m, w, *c)
+        for m, w in masks
         for c in CELLS
         if c[0] in args.regime and c[2] in args.heads
     ]
     rows = []
-    for index, (mask, regime, b, h, target_size) in enumerate(cells, 1):
+    for index, (mask, max_attn_len, regime, b, h, target_size) in enumerate(cells, 1):
         tag = f"{mask} {regime} B={b} H={h} targets={target_size}"
         # Printed before the cell runs so a long compile is not silent.
         print(f"[{index}/{len(cells)}] {tag} ... ", end="", flush=True)
         cell_rows = bench_cell(
-            mask, regime, b, h, target_size, providers, args.reps, pp_tile
+            mask, max_attn_len, regime, b, h, target_size, providers, args.reps,
+            pp_tile,
         )
         rows += cell_rows
         print(
