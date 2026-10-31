@@ -26,7 +26,7 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
     async_copy_supported_on_arch,
 )
 
-from .kernels_common import set_slp_vectorize_once_used
+from .kernels_common import set_llvm_sched_strategy, set_slp_vectorize_once_used
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
 from .splitk_epilogue import CPOL_COHERENT, splitk_reduce_epilogue
 
@@ -152,6 +152,7 @@ def compile_preshuffle_gemm(
     lds_stage: int = 2,
     split_k: int = 1,
     scale_mode: str = "epilogue",
+    llvm_sched_strategy: str | None = None,
 ):
     """Compile preshuffle GEMM (fp8/int8/fp16/bf16).
     Signature: fn(C, out, semaphore, A, B, scale_a, scale_b, bias, M, N, stream).
@@ -1216,4 +1217,5 @@ def compile_preshuffle_gemm(
 
     # After the f16 assignment above: that one replaces llvm_options outright.
     set_slp_vectorize_once_used(launch_gemm, False)
+    set_llvm_sched_strategy(launch_gemm, llvm_sched_strategy)
     return launch_gemm

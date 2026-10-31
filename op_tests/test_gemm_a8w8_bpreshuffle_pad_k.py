@@ -173,6 +173,28 @@ def test_two_wave_vgpr_estimate_uses_128_threads():
     assert _estimate_max_wpe(32, 64, 512, total_vgpr=12) == 1
 
 
+def test_maxmem_scheduler_token_sets_llvm_sched_strategy():
+    from aiter.ops.flydsl.kernels import kernels_common
+    from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
+
+    name = "flydsl_bpreshuflle_16x32x512_F8_F8_B16_0x0x0x1_maxmem_ks3_smbs"
+    parsed = gemm_mod._parse_flydsl_kernel_name(name)
+    assert parsed == (16, 32, 512, 0, 0, 0, 1, "maxmem", 3, "blockscale")
+    assert kernels_common.llvm_sched_strategy_for("maxmem") == "max-memory-clause"
+    assert kernels_common.llvm_sched_strategy_for("MaxMem") == "max-memory-clause"
+    assert kernels_common.llvm_sched_strategy_for("default") is None
+    assert kernels_common.llvm_sched_strategy_for("off") is None
+
+    kw = dict(N=5376, K=21504, tile_m=16, tile_n=32, tile_k=512, split_k=3)
+    kw["scale_mode"] = "blockscale"
+    hinted = compile_preshuffle_gemm(**kw, llvm_sched_strategy="max-memory-clause")
+    plain = compile_preshuffle_gemm(**kw)
+    assert hinted is not plain
+    opts = hinted.compile_hints.get("llvm_options", {})
+    assert opts.get("amdgpu-sched-strategy") == "max-memory-clause"
+    assert "amdgpu-sched-strategy" not in plain.compile_hints.get("llvm_options", {})
+
+
 def test_tuner_small_m_candidates_by_arch():
     from aiter.ops.flydsl.gemm_tune import flydsl_gemm_a8w8_bpreshuffle_common as c
 

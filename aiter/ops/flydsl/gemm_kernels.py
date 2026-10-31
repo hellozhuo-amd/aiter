@@ -334,8 +334,12 @@ def flydsl_preshuffle_gemm_a8(
     split_k: int = 1,
     *,
     scale_mode: str = "epilogue",
+    llvm_sched_strategy: str | None = None,
 ) -> Tensor:
     """Run preshuffle GEMM with per-row/column or per-128-K FP32 scales.
+
+    llvm_sched_strategy: optional LLVM ``amdgpu-sched-strategy`` for this kernel
+    (from the kernel-name scheduler token, e.g. ``maxmem``).
 
     Blockscale reads x_scale in K-block-major storage: contiguous [K/128, M],
     or [M, K/128] with quantizer-transposed storage or column-major strides.
@@ -446,6 +450,7 @@ def flydsl_preshuffle_gemm_a8(
         lds_stage=int(lds_stage),
         split_k=int(split_k),
         scale_mode=scale_mode,
+        llvm_sched_strategy=llvm_sched_strategy,
     )
 
     def _as_i8(t):

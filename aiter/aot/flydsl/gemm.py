@@ -75,7 +75,10 @@ from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
 from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
     compile_gemm_a16w16 as compile_gemm_a16w16_gfx1250,
 )
-from aiter.ops.flydsl.kernels.kernels_common import run_cached
+from aiter.ops.flydsl.kernels.kernels_common import (
+    llvm_sched_strategy_for,
+    run_cached,
+)
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
@@ -562,6 +565,7 @@ def _compile_preshuffle_to_cache(
         lds_stage=lds_stage,
         split_k=k_split,
         scale_mode=scale_mode,
+        llvm_sched_strategy=llvm_sched_strategy_for(scheduler),
     )
     # Match runtime's static scale layouts, including each scalar specialization.
     scale_pairs = [(scale_a, scale_b)]

@@ -203,6 +203,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
         _check_preshuffle_launch_shape,
         flydsl_preshuffle_gemm_a8,
     )
+    from .flydsl.kernels.kernels_common import llvm_sched_strategy_for
 
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
@@ -248,6 +249,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
         lds_stage=lds_stage,
         enable_scheduler=str(scheduler).lower() != "off",
         split_k=k_split,
+        llvm_sched_strategy=llvm_sched_strategy_for(scheduler),
     )
     return Out
 
@@ -1184,6 +1186,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
         elif libtype == "flydsl":
             if kernelName.startswith("flydsl_bpreshuflle_"):
                 from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+                from .flydsl.kernels.kernels_common import llvm_sched_strategy_for
 
                 parsed = _parse_flydsl_kernel_name(kernelName)
                 if parsed is None:
@@ -1212,6 +1215,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
                     enable_scheduler=str(sched).lower() != "off",
                     split_k=ks,
                     scale_mode="blockscale",
+                    llvm_sched_strategy=llvm_sched_strategy_for(sched),
                 )
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config

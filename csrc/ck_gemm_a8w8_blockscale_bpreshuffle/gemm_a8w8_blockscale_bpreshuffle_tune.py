@@ -80,6 +80,7 @@ def run_gemm_flydsl_blockscale(
     x, weight_shuffle, x_scale, w_scale, out, kernel_id, k_split=1
 ):
     from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+    from aiter.ops.flydsl.kernels.kernels_common import llvm_sched_strategy_for
 
     ki = kernels_list_blockscale[kernel_id]
     flydsl_preshuffle_gemm_a8(
@@ -98,6 +99,7 @@ def run_gemm_flydsl_blockscale(
         enable_scheduler=ki.enable_scheduler,
         split_k=k_split,
         scale_mode="blockscale",
+        llvm_sched_strategy=llvm_sched_strategy_for(ki.sScheduler),
     )
     return out
 

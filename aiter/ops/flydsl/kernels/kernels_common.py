@@ -273,3 +273,41 @@ def set_slp_vectorize_once_used(jit_fn, enabled):
         options = jit_fn.compile_hints.setdefault("llvm_options", {})
         options[_SLP_VECTORIZE_ONCE_USED] = bool(enabled)
     return jit_fn
+
+
+# Kernel-name scheduler tokens that also pick an LLVM machine scheduler. Any other
+# token ("default", "off", ...) leaves LLVM's default strategy.
+_SCHED_TOKEN_STRATEGY = {"maxmem": "max-memory-clause"}
+_AMDGPU_SCHED_STRATEGY = "amdgpu-sched-strategy"
+_sched_strategy_available = None
+
+
+def llvm_sched_strategy_for(scheduler) -> str | None:
+    """LLVM ``amdgpu-sched-strategy`` named by a kernel-name scheduler token."""
+    return _SCHED_TOKEN_STRATEGY.get(str(scheduler).lower())
+
+
+def set_llvm_sched_strategy(jit_fn, strategy):
+    """Compile this JIT with ``amdgpu-sched-strategy=<strategy>`` (None: unchanged).
+
+    max-memory-clause keeps more global loads in flight instead of scheduling
+    for occupancy. Whether it helps depends on the kernel and the bundled LLVM,
+    so it is set per kernel from its tuned name, never globally. The hint is
+    attached only when the cl::opt exists in this flydsl's LLVM.
+    """
+    global _sched_strategy_available
+    if not strategy:
+        return jit_fn
+    if _sched_strategy_available is None:
+        try:
+            from flydsl._mlir._mlir_libs import _mlirDialectsFly as fly
+
+            previous = fly.set_llvm_option_str(_AMDGPU_SCHED_STRATEGY, "")
+            fly.set_llvm_option_str(_AMDGPU_SCHED_STRATEGY, previous)
+            _sched_strategy_available = True
+        except RuntimeError:
+            _sched_strategy_available = False
+    if _sched_strategy_available:
+        options = jit_fn.compile_hints.setdefault("llvm_options", {})
+        options[_AMDGPU_SCHED_STRATEGY] = str(strategy)
+    return jit_fn
