@@ -1,12 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import itertools
+import sys
+
+import pandas as pd
 import pytest
 import torch
 
+import aiter
 from aiter import dtypes
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops import gemm_op_a8w8 as gemm_mod
 from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+torch.set_default_device("cuda")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -30,6 +41,127 @@ def test_preshuffle_flat_buffers_stay_below_4gib():
         _check_preshuffle_flat_buffer_capacity(16, 65536, 65536, 1, 1, 2)
 
 
+@pytest.mark.parametrize(
+    "m, n, k, kernel_name, backend",
+    [
+        # Kimi-K3's 6144x7168 M=8192 row, which padded-M lookup returns for
+        # every M > 8192.
+        (65536, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "flydsl"),
+        (65537, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "ck"),
+        # Past M=174592 the bf16 output, padded to 256 rows, reaches 2 GiB and
+        # CK writes wrong rows, so the FlyDSL launcher raises instead.
+        (174592, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "ck"),
+        (174593, 6144, 7168, "128x256x128_F8_F8_B16_1x2x4x2_default", "raises"),
+        # The 57344x8192 M=8192 row on main: the output is past 2 GiB here.
+        (65537, 57344, 8192, "256x128x128_F8_F8_B16_1x2x0x2_default", "raises"),
+    ],
+)
+@pytest.mark.parametrize("stride", [1, 2], ids=["dense", "strided"])
+def test_flydsl_bpreshuffle_row_falls_back_to_ck_above_m_max(
+    monkeypatch, m, n, k, kernel_name, backend, stride
+):
+    from aiter.ops.flydsl import gemm_kernels
+
+    row = {
+        "libtype": "flydsl",
+        "splitK": 0,
+        "kernelName": f"flydsl_bpreshuflle_{kernel_name}",
+    }
+    # Meta tensors stand in for activations and outputs of several GiB. A
+    # K-strided XQ (a view of every other column) and row-strided scale views
+    # must reach CK made contiguous.
+    xq = torch.empty((m, k * stride), device="meta", dtype=dtypes.fp8)[:, ::stride]
+    wq = torch.empty((n, k), device="meta", dtype=dtypes.fp8)
+    x_scale, w_scale = (
+        torch.empty((rows, stride), device="meta", dtype=torch.float32)[:, :1]
+        for rows in (m, n)
+    )
+    out = torch.empty((m, n), device="meta", dtype=torch.bfloat16)
+    seen = []
+
+    def fake_flydsl(*args, **kwargs):
+        seen.append("flydsl")
+
+    def fake_ck(XQ, WQ, x_scale, w_scale, Y, splitK=0):
+        assert all(t.is_contiguous() for t in (XQ, WQ, x_scale, w_scale))
+        seen.append("ck")
+        return Y
+
+    # gfx1250 routes every kernel name to its WMMA backend before the M-limit check.
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(gemm_kernels, "flydsl_preshuffle_gemm_a8", fake_flydsl)
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
+
+    if backend == "raises":
+        with pytest.raises(RuntimeError, match=r"M .* exceeds 65536"):
+            gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+        assert seen == []
+        return
+
+    got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+
+    assert gemm_kernels.PRESHUFFLE_M_MAX == 65536
+    assert seen == [backend]
+    assert got is out
+
+
+@pytest.mark.parametrize(
+    "m, n, k, kernel_name, backend",
+    [
+        # Kimi-K3's 2112x7168 M=1 row also supports uneven padded-K splits.
+        (1, 2112, 7168, "16x64x512_F8_F8_B16_1x2x0x2_default_ks7", "flydsl"),
+        (1, 2112, 8192, "16x64x512_F8_F8_B16_1x2x0x2_default_ks7", "flydsl"),
+        # K must remain a multiple of tile_k, regardless of split_k.
+        (1, 2112, 7040, "16x64x512_F8_F8_B16_1x2x0x2_default_ks2", "ck"),
+        (1, 2112, 8192, "16x64x512_F8_F8_B16_1x2x0x2_default_ks4", "flydsl"),
+        # Oversized M with an incompatible padded K must not reach CK, whose
+        # output is wrong past 2 GiB: the FlyDSL error is raised instead.
+        (175000, 6144, 7232, "128x256x128_F8_F8_B16_1x2x4x2_default", "raises"),
+        (65537, 6144, 7232, "128x256x128_F8_F8_B16_1x2x4x2_default", "ck"),
+    ],
+)
+@pytest.mark.parametrize("stride", [1, 2], ids=["dense", "strided"])
+def test_flydsl_bpreshuffle_dispatch_accepts_ragged_splits_and_checks_limits(
+    monkeypatch, m, n, k, kernel_name, backend, stride
+):
+    from aiter.ops.flydsl import gemm_kernels
+
+    row = {"kernelName": f"flydsl_bpreshuflle_{kernel_name}"}
+    xq = torch.empty((m, k), device="meta", dtype=dtypes.fp8)
+    wq = torch.empty((n, k), device="meta", dtype=dtypes.fp8)
+    # Row-strided scale views, e.g. backing[:, :1], must reach CK made contiguous.
+    x_scale, w_scale = (
+        torch.empty((rows, stride), device="meta", dtype=torch.float32)[:, :1]
+        for rows in (m, n)
+    )
+    out = torch.empty((m, n), device="meta", dtype=torch.bfloat16)
+    seen = []
+
+    def fake_ck(XQ, WQ, x_scale, w_scale, Y, splitK=0):
+        assert x_scale.is_contiguous() and w_scale.is_contiguous()
+        seen.append("ck")
+        return Y
+
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(
+        gemm_kernels,
+        "flydsl_preshuffle_gemm_a8",
+        lambda *args, **kwargs: seen.append("flydsl"),
+    )
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
+
+    if backend == "raises":
+        with pytest.raises(RuntimeError, match=r"M .* exceeds 65536"):
+            gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+        assert seen == []
+        return
+
+    got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+
+    assert seen == [backend]
+    assert got is out
+
+
 def test_two_wave_vgpr_estimate_uses_128_threads():
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
         _estimate_max_wpe,
@@ -39,6 +171,37 @@ def test_two_wave_vgpr_estimate_uses_128_threads():
     # for the 2-wave path and 32x64 / 256 threads for the standard 4-wave path.
     assert _estimate_max_wpe(32, 32, 512, total_vgpr=12) == 1
     assert _estimate_max_wpe(32, 64, 512, total_vgpr=12) == 1
+
+
+def test_tuner_small_m_candidates_by_arch():
+    from aiter.ops.flydsl.gemm_tune import flydsl_gemm_a8w8_bpreshuffle_common as c
+
+    for arch in ("gfx942", "gfx950"):
+        pt = (
+            [
+                k
+                for k in c.kernels_list_942.values()
+                if c.kernel_fits_shape(k, 4, 2048, 2176, arch)
+            ]
+            if arch == "gfx942"
+            else [
+                k
+                for k in c.kernels_list_950.values()
+                if c.kernel_fits_shape(k, 4, 2048, 2176, arch)
+            ]
+        )
+        bs = [
+            k
+            for k in getattr(c, f"kernels_list_blockscale_{arch[3:]}").values()
+            if c.kernel_fits_shape(k, 4, 2048, 2176, arch)
+        ]
+        # K=2176 needs tile_k=128; M-overhanging 32-row tiles are admitted.
+        assert pt and bs
+        assert any(k.tile_m == 32 for k in pt)
+        if arch == "gfx942":
+            assert not any(k.use_async_copy for k in pt + bs)
+    assert not c.async_copy_supported_on_arch("gfx942")
+    assert c.async_copy_supported_on_arch("gfx950")
 
 
 def test_shuffle_weight_pad_k_to_pads_last_dim():
@@ -205,3 +368,556 @@ def test_gemm_a8w8_bpreshuffle_rejects_short_weight_k():
 
     with pytest.raises(RuntimeError, match="WQ K >= XQ K"):
         gemm_mod.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, dtype=torch.bfloat16)
+
+
+# --- FlyDSL preshuffle GEMM scale-form / blockscale cases (moved from
+# flydsl_tests/, which CI does not discover). Called through the FlyDSL op
+# wrapper with production shuffle_weight / quantizer layouts.
+requires_flydsl_gfx = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx_runtime() not in ("gfx942", "gfx950"),
+    reason="gfx942 or gfx950 required",
+)
+
+K = 2176
+N = 2048
+CONFIGS = [(1, 16, 64, 128, 1), (4, 32, 64, 128, 6)]
+
+
+def _make(m, n, k):
+    g = torch.Generator(device="cuda").manual_seed(1)
+    a = torch.randn(m, k, generator=g, device="cuda") * 0.5
+    b = torch.randn(n, k, generator=g, device="cuda") * 0.5
+    aq, xs = aiter.per_tensor_quant(a, quant_dtype=dtypes.fp8)
+    bq, ws = aiter.per_tensor_quant(b, quant_dtype=dtypes.fp8)
+    ref = (aq.float() * xs.float()) @ (bq.float() * ws.float()).T
+    return aq, xs.float(), shuffle_weight(bq, layout=(16, 16)), ws.float(), ref
+
+
+def _shape(s, rows):
+    return {
+        "expanded": lambda: s.reshape(1, 1).expand(rows, 1).contiguous(),
+        "scalar1": lambda: s.reshape(1),
+        "scalar11": lambda: s.reshape(1, 1),
+    }
+
+
+@requires_flydsl_gfx
+@pytest.mark.parametrize(
+    "form", ["expanded", "scalar1", "scalar11", "scalar_x", "scalar_w"]
+)
+@pytest.mark.parametrize("m,tm,tn,tk,sk", CONFIGS)
+def test_per_tensor_scale_forms(m, tm, tn, tk, sk, form):
+    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    aq, xs, wq, ws, ref = _make(m, N, K)
+    out = torch.full((m, N), float("nan"), device="cuda", dtype=dtypes.bf16)
+    x_form = (
+        "scalar1" if form == "scalar_x" else "expanded" if form == "scalar_w" else form
+    )
+    w_form = (
+        "scalar1" if form == "scalar_w" else "expanded" if form == "scalar_x" else form
+    )
+    flydsl_preshuffle_gemm_a8(
+        aq,
+        wq,
+        _shape(xs, m)[x_form](),
+        _shape(ws, N)[w_form](),
+        out,
+        tm,
+        tn,
+        tk,
+        0,
+        0,
+        0,
+        lds_stage=2,
+        enable_scheduler=True,
+        split_k=sk,
+    )
+    torch.cuda.synchronize()
+    o = out.float()
+    tol = 5e-3 * ref.abs().max() + 1e-2 * ref.abs()
+    assert torch.isfinite(o).all()
+    assert (o - ref).abs().le(tol).all()
+
+
+@requires_flydsl_gfx
+@pytest.mark.parametrize("tile_n", [48, 80, 96, 112])
+def test_unsupported_tile_width_raises(tile_n):
+    from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
+
+    with pytest.raises(
+        ValueError, match="tile_n must be 16, 32, or a positive multiple of 64"
+    ):
+        compile_preshuffle_gemm(
+            N=256, K=256, tile_m=32, tile_n=tile_n, tile_k=128, in_dtype="fp8"
+        )
+
+
+@requires_flydsl_gfx
+def test_wrong_length_scale_raises():
+    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    m = 4
+    aq, _xs, wq, ws, _ = _make(m, N, K)
+    out = torch.empty((m, N), device="cuda", dtype=dtypes.bf16)
+    bad = torch.ones(m + 1, 1, device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="x_scale"):
+        flydsl_preshuffle_gemm_a8(aq, wq, bad, ws.reshape(1), out, 32, 64, 128, 0, 0, 0)
+
+
+BLOCKSCALE_CONFIGS = [
+    (m, 2048, k, 32, 128, 1) for m in (1, 4, 16) for k in (2176, 7168)
+] + [
+    (1, 2048, 2176, 32, 128, 6),
+    (4, 2048, 7168, 32, 256, 1),
+    (1, 2048, 2176, 16, 128, 1),
+    (16, 4096, 7168, 32, 128, 1),
+    (4, 6144, 2176, 16, 128, 6),
+]
+
+
+@requires_flydsl_gfx
+@pytest.mark.parametrize(
+    "m,n,k,tm,tk,sk,tn",
+    [(*config, 64) for config in BLOCKSCALE_CONFIGS]
+    + [(4, 256, 256, 32, 128, 1, tn) for tn in (16, 32, 128)],
+)
+def test_blockscale(m, n, k, tm, tk, sk, tn):
+    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    g = torch.Generator(device="cuda").manual_seed(123)
+    aq = (torch.rand((m, k), generator=g, device="cuda") - 0.5).to(dtypes.fp8)
+    bq = (torch.rand((n, k), generator=g, device="cuda") - 0.5).to(dtypes.fp8)
+    # Distinct row/column and K-block scales expose transposition and pairing errors.
+    kb = torch.arange(k // 128, device="cuda", dtype=torch.float32)
+    rows = torch.arange(m, device="cuda", dtype=torch.float32)
+    cols = torch.arange(n // 128, device="cuda", dtype=torch.float32)
+    xs = (0.5 + (kb[:, None] % 7) * 0.125 + rows[None, :] * 0.0625).contiguous()
+    ws = (0.75 + (cols[:, None] % 5) * 0.125 + (kb[None, :] % 11) * 0.0625).contiguous()
+    a = aq.float() * xs.T.repeat_interleave(128, dim=1)
+    b = bq.float() * ws.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    ref = a @ b.T
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=dtypes.bf16)
+    wq = shuffle_weight(bq, layout=(16, 16))
+    tol = 5e-3 * ref.abs().max() + 1e-2 * ref.abs()
+    for _ in range(5):
+        out.fill_(float("nan"))
+        flydsl_preshuffle_gemm_a8(
+            aq,
+            wq,
+            xs,
+            ws,
+            out,
+            tm,
+            tn,
+            tk,
+            0,
+            0,
+            0,
+            lds_stage=2,
+            enable_scheduler=True,
+            split_k=sk,
+            scale_mode="blockscale",
+        )
+        torch.cuda.synchronize()
+        o = out.float()
+        nonfinite = (~torch.isfinite(o)).sum().item()
+        bad = ((o - ref).abs() > tol).sum().item()
+        assert nonfinite == 0, f"nonfinite={nonfinite}"
+        assert bad == 0, f"bad={bad}"
+
+
+@requires_flydsl_gfx
+@pytest.mark.parametrize("layout", ["quantizer", "column_major", "k_major"])
+def test_blockscale_quantizer_public_dispatch(monkeypatch, layout):
+    from aiter.ops import gemm_op_a8w8 as gemm_mod
+
+    m, n, k = 4, 256, 2176
+    g = torch.Generator(device="cuda").manual_seed(19)
+    a = torch.randn((m, k), generator=g, device="cuda", dtype=dtypes.bf16)
+    aq, xs = aiter.per_group_quant_hip(
+        a, quant_dtype=dtypes.fp8, group_size=128, transpose_scale=True
+    )
+    logical_xs = xs.view(k // 128, m).T
+    bq = (torch.rand((n, k), generator=g, device="cuda") - 0.5).to(dtypes.fp8)
+    ws = torch.linspace(0.5, 1.5, (n // 128) * (k // 128), device="cuda").reshape(
+        n // 128, k // 128
+    )
+    ref = (aq.float() * logical_xs.repeat_interleave(128, dim=1)) @ (
+        bq.float() * ws.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    ).T
+    if layout == "column_major":
+        xs = logical_xs
+    elif layout == "k_major":
+        xs = xs.view(k // 128, m)
+    monkeypatch.setattr(
+        gemm_mod,
+        "get_CKGEMM_config",
+        lambda *args, **kwargs: {
+            "libtype": "flydsl",
+            "kernelName": "flydsl_bpreshuflle_32x64x128_fp8_bf16_none_0x0x0x2_smbs",
+        },
+    )
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=dtypes.bf16)
+    result = aiter.gemm_a8w8_blockscale_bpreshuffle(
+        aq, shuffle_weight(bq, layout=(16, 16)), xs, ws, dtypes.bf16, out=out
+    )
+    torch.cuda.synchronize()
+    assert result is out
+    tol = 5e-3 * ref.abs().max() + 1e-2 * ref.abs()
+    assert torch.isfinite(out).all()
+    assert (out.float() - ref).abs().le(tol).all()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx_runtime() != "gfx942",
+    reason="gfx942 async-copy rejection",
+)
+def test_gfx942_async_copy_raises():
+    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    aq, xs, wq, ws, _ = _make(1, N, K)
+    out = torch.empty((1, N), device="cuda", dtype=dtypes.bf16)
+    with pytest.raises(ValueError, match="LDS-direct loads unavailable on gfx942"):
+        flydsl_preshuffle_gemm_a8(aq, wq, xs, ws, out, 32, 64, 128, use_async_copy=1)
+
+
+@requires_flydsl_gfx
+@pytest.mark.parametrize(
+    "m,k,tm,tn,sk",
+    [
+        (1, 2176, 32, 64, 6),
+        (4, 7168, 32, 64, 1),
+        (16, 2176, 32, 64, 1),
+        (4, 2176, 16, 128, 3),
+    ],
+)
+def test_per_row_scales(m, k, tm, tn, sk):
+    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    g = torch.Generator(device="cuda").manual_seed(1)
+    aq = (torch.rand((m, k), generator=g, device="cuda") - 0.5).to(dtypes.fp8)
+    bq = (torch.rand((N, k), generator=g, device="cuda") - 0.5).to(dtypes.fp8)
+    wq = shuffle_weight(bq, layout=(16, 16))
+    xs = torch.linspace(0.5, 1.5, m, device="cuda").reshape(m, 1)
+    ws = torch.linspace(0.75, 1.25, N, device="cuda").reshape(N, 1)
+    ref = (aq.float() * xs) @ (bq.float() * ws).T
+    out = torch.full((m, N), float("nan"), device="cuda", dtype=dtypes.bf16)
+    tol = 5e-3 * ref.abs().max() + 1e-2 * ref.abs()
+    for _ in range(5):
+        out.fill_(float("nan"))
+        flydsl_preshuffle_gemm_a8(
+            aq, wq, xs, ws, out, tm, tn, 128, 0, 0, 0, lds_stage=2, split_k=sk
+        )
+        torch.cuda.synchronize()
+        o = out.float()
+        assert torch.isfinite(o).all()
+        assert (o - ref).abs().le(tol).all()
+
+
+def _padded_k_backend(m, n, k, w_k):
+    """(libtype, split-K?) the dispatcher picks for a K-padded weight, or None."""
+    for kk in (k, w_k):
+        config = gemm_mod.get_GEMM_config_with_quant_type(
+            m, n, kk, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+        )
+        if config is not None:
+            return config["libtype"], int(config["splitK"]) > 0
+    return None
+
+
+def run_torch(xq, x_scale, wq, w_scale, dtype=dtypes.bf16):
+    # Reference only: fp32 dequant GEMM over the logical K. Not timed, not in the table.
+    out = (xq.to(dtypes.fp32) * x_scale) @ (wq.to(dtypes.fp32) * w_scale).t()
+    return out.to(dtype)
+
+
+@benchmark()
+def test_gemm_a8w8_bpreshuffle_pad_k(m, n, k, w_k, dtype):
+    torch.manual_seed(0)
+    x = torch.randn((m, k), dtype=dtypes.bf16)
+    w = torch.randn((n, k), dtype=dtypes.bf16)
+    xq, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
+    wq, w_scale = aiter.pertoken_quant(w, quant_dtype=dtypes.fp8)
+    ref = run_torch(xq, x_scale, wq, w_scale, dtype)
+    # As in the model: the weight is preshuffled once with K padded to w_k and
+    # the logical-K activation goes straight into the dispatcher.
+    wq_padded = shuffle_weight(wq, layout=(16, 16), pad_k_to=w_k)
+    assert wq_padded.shape == (n, w_k)
+
+    candidates = {
+        "a8w8_bpreshuffle": lambda: gemm_mod.gemm_a8w8_bpreshuffle(
+            xq, wq_padded, x_scale, w_scale, dtype=dtype
+        ),
+    }
+
+    backend = _padded_k_backend(m, n, k, w_k)
+    # Split-K sums bf16 partials, so small outputs pick up ~1 ulp of the row
+    # magnitude; a misread weight is still off by O(|ref|).
+    atol = 1.0 if backend is not None and backend[1] else 1e-2
+
+    # Every backend runs at the padded K: XQ is zero-padded to w_k before launch.
+    flops = 2 * m * n * w_k
+    nbytes = (m * w_k + n * w_k) * xq.element_size() + m * n * ref.element_size()
+
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "backend": (
+            "untuned"
+            if backend is None
+            else backend[0] + ("-splitk" if backend[1] else "")
+        ),
+    }
+    for name, fn in candidates.items():
+        out, us = run_perftest(fn)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=atol,
+            msg=f"{name}: M={m} N={n} K={k}->{w_k} ",
+            catastrophic_check=True,
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+# Shape-arg sweep fn, not a pytest test: the parametrized wrapper below calls it.
+test_gemm_a8w8_bpreshuffle_pad_k.__test__ = False
+
+
+# (case id, expected (libtype, split-K?), (m, n, k, w_k)) per (gfx, cu_num) tuned
+# table: rows reaching each CK/CKTile/FlyDSL path with a K-padded weight, either
+# through the logical-K row or the padded-K fallback lookup, plus untuned shapes.
+_UNTUNED_CASES = [
+    ("untuned", None, (37, 1280, 448, 512)),
+    ("untuned-half", None, (37, 1280, 256, 512)),
+]
+_PADDED_K_CASES = {
+    ("gfx950", 256): _UNTUNED_CASES
+    + [
+        ("ck-logical-k", ("ck", False), (1, 64, 4096, 4224)),
+        ("ck-splitk-logical-k", ("ck", True), (4, 64, 4096, 4224)),
+        ("cktile-logical-k", ("cktile", False), (1, 1536, 128, 256)),
+        ("ck-padded-k-row", ("ck", False), (32, 384, 7040, 7168)),
+        ("cktile-padded-k-row", ("cktile", False), (2048, 384, 7040, 7168)),
+        ("flydsl-padded-k-row", ("flydsl", False), (512, 384, 7040, 7168)),
+    ],
+    # The 304-CU gfx942 table has no fp8 rows, so only the untuned fallback runs.
+    ("gfx942", 304): _UNTUNED_CASES,
+    ("gfx942", 80): _UNTUNED_CASES
+    + [
+        ("ck-logical-k", ("ck", False), (1, 64, 7168, 7296)),
+        ("cktile-logical-k", ("cktile", False), (1, 2048, 2048, 2176)),
+        ("ck-padded-k-row", ("ck", False), (1, 64, 7040, 7168)),
+        ("cktile-padded-k-row", ("cktile", False), (1, 2048, 1920, 2048)),
+    ],
+}
+
+# Cards the CK/CKTile bpreshuffle paths are built for. gfx1250 has no CK path,
+# and its untuned FlyDSL fallback is not covered by these shapes.
+SUPPORTED_GFX = ["gfx942", "gfx950"]
+# checkAllclose default: max fraction of mismatching elements per case.
+TOL_ERR_RATIO = 0.05
+
+
+@pytest.mark.parametrize(
+    "device,backend,mnk",
+    [(dev, *c[1:]) for dev, cases in _PADDED_K_CASES.items() for c in cases],
+    ids=[
+        f"{gfx}-cu{cu}-{c[0]}"
+        for (gfx, cu), cases in _PADDED_K_CASES.items()
+        for c in cases
+    ],
+)
+def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(device, backend, mnk):
+    # Dispatch keys the tuned CSV with (get_gfx_runtime(), get_cu_num()), and the
+    # untuned fallback is arch-specific too, so a row only holds on the full
+    # device its table was picked from, not on a partitioned one.
+    if (get_gfx_runtime(), get_cu_num()) != device:
+        pytest.skip(f"rows are picked from the {device[0]} cu_num={device[1]} table")
+    m, n, k, w_k = mnk
+    assert (
+        _padded_k_backend(m, n, k, w_k) == backend
+    ), f"M={m} N={n} K={k}->{w_k} no longer selects {backend}; pick another row"
+    ret = test_gemm_a8w8_bpreshuffle_pad_k(m, n, k, w_k, dtypes.bf16)
+    assert ret["a8w8_bpreshuffle err"] <= TOL_ERR_RATIO, ret
+
+
+# (case id, tuned kernelName, (m, n, k, w_k), backend) by (gfx, cu_num): Kimi-K3
+# Covers a genuine CK fallback and a supported ragged FlyDSL split.
+_FLYDSL_DISPATCH_CASES = {
+    ("gfx950", 256): [
+        # M=65537 > PRESHUFFLE_M_MAX takes the M=8192 row through padded-M lookup.
+        (
+            "m-above-max",
+            "flydsl_bpreshuflle_128x256x128_F8_F8_B16_1x2x4x2_default",
+            (65537, 6144, 7168, 7168),
+            "ck",
+        ),
+        # The padded K has 16 tiles split unevenly across seven workgroups.
+        (
+            "padded-k-split-k",
+            "flydsl_bpreshuflle_16x64x512_F8_F8_B16_1x2x0x2_default_ks7",
+            (1, 2112, 7168, 8192),
+            "flydsl",
+        ),
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "device,kernel_name,mnk,backend",
+    [(dev, *c[1:]) for dev, cases in _FLYDSL_DISPATCH_CASES.items() for c in cases],
+    ids=[
+        f"{gfx}-cu{cu}-{c[0]}"
+        for (gfx, cu), cases in _FLYDSL_DISPATCH_CASES.items()
+        for c in cases
+    ],
+)
+def test_gemm_a8w8_bpreshuffle_flydsl_dispatch_matches_reference(
+    monkeypatch, device, kernel_name, mnk, backend
+):
+    if (get_gfx_runtime(), get_cu_num()) != device:
+        pytest.skip(f"rows are picked from the {device[0]} cu_num={device[1]} table")
+    from aiter.ops.flydsl import gemm_kernels
+
+    m, n, k, w_k = mnk
+    config = gemm_mod.get_GEMM_config_with_quant_type(
+        m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    )
+    assert (
+        config is not None and config["kernelName"] == kernel_name
+    ), f"M={m} N={n} K={k} no longer selects {kernel_name}; pick another row"
+
+    seen = []
+    ck, flydsl = (
+        gemm_mod.gemm_a8w8_bpreshuffle_ck,
+        gemm_kernels.flydsl_preshuffle_gemm_a8,
+    )
+
+    def record_ck(*args, **kwargs):
+        seen.append("ck")
+        return ck(*args, **kwargs)
+
+    def record_flydsl(*args, **kwargs):
+        seen.append("flydsl")
+        return flydsl(*args, **kwargs)
+
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", record_ck)
+    monkeypatch.setattr(gemm_kernels, "flydsl_preshuffle_gemm_a8", record_flydsl)
+
+    ret = test_gemm_a8w8_bpreshuffle_pad_k(m, n, k, w_k, dtypes.bf16)
+
+    assert set(seen) == {backend}, seen
+    assert ret["a8w8_bpreshuffle err"] <= TOL_ERR_RATIO, ret
+
+
+@pytest.mark.parametrize(
+    "device,kernel_name,mnk,backend",
+    [(dev, *c[1:]) for dev, cases in _FLYDSL_DISPATCH_CASES.items() for c in cases],
+    ids=[
+        f"{gfx}-cu{cu}-{c[0]}"
+        for (gfx, cu), cases in _FLYDSL_DISPATCH_CASES.items()
+        for c in cases
+    ],
+)
+def test_gemm_a8w8_bpreshuffle_flydsl_dispatch_strided_scales(
+    device, kernel_name, mnk, backend
+):
+    """Row-strided scale views match contiguous scales on both dispatch paths.
+
+    CK reads the scales through raw pointers, so a view such as backing[:, :1]
+    gave wrongly scaled rows unless the fallback makes it contiguous.
+    """
+    if (get_gfx_runtime(), get_cu_num()) != device:
+        pytest.skip(f"rows are picked from the {device[0]} cu_num={device[1]} table")
+    m, n, k, w_k = mnk
+    config = gemm_mod.get_GEMM_config_with_quant_type(
+        m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    )
+    assert (
+        config is not None and config["kernelName"] == kernel_name
+    ), f"M={m} N={n} K={k} no longer selects {kernel_name}; pick another row"
+    torch.manual_seed(0)
+    xq = torch.randn((m, k), dtype=dtypes.bf16).to(dtypes.fp8)
+    wq = shuffle_weight(
+        torch.randn((n, k), dtype=dtypes.bf16).to(dtypes.fp8),
+        layout=(16, 16),
+        pad_k_to=w_k,
+    )
+    x_scale = (torch.rand((m, 2), dtype=torch.float32) + 0.5)[:, :1]
+    w_scale = (torch.rand((n, 2), dtype=torch.float32) + 0.5)[:, :1]
+
+    got = gemm_mod.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, dtype=dtypes.bf16)
+    want = gemm_mod.gemm_a8w8_bpreshuffle(
+        xq, wq, x_scale.contiguous(), w_scale.contiguous(), dtype=dtypes.bf16
+    )
+    # Same kernel on the same values: the outputs must match bit for bit.
+    err = checkAllclose(
+        want.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0,
+        msg=f"strided scales: M={m} N={n} K={k}->{w_k} ",
+    )
+    assert err == 0, err
+
+
+def main():
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "gemm_a8w8_bpreshuffle padded K unsupported on %s; skipping",
+            get_gfx_runtime(),
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.d_dtypes["bf16"]],
+        help="""Output data type.
+    e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[
+            c[2]
+            for c in _PADDED_K_CASES.get(
+                (get_gfx_runtime(), get_cu_num()), _UNTUNED_CASES
+            )
+            + _FLYDSL_DISPATCH_CASES.get((get_gfx_runtime(), get_cu_num()), [])
+        ],
+        help="""Shape m,n,k,w_k: k is the activation K, w_k the padded weight K.
+    e.g.: -s 37,1280,448,512""",
+    )
+    args = parser.parse_args()
+
+    df = []
+    for dtype, (m, n, k, w_k) in itertools.product(args.dtype, args.mnk):
+        df.append(test_gemm_a8w8_bpreshuffle_pad_k(m, n, k, w_k, dtype))
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "gemm_a8w8_bpreshuffle padded K summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+    bad = df[df["a8w8_bpreshuffle err"] > TOL_ERR_RATIO]
+    assert bad.empty, f"padded-K mismatch above {TOL_ERR_RATIO}:\n{bad}"
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(pytest.main(["-q", "-rs", __file__]))
