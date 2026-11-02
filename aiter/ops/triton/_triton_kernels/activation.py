@@ -3,6 +3,7 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -258,12 +259,18 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             )
 
 
+_act_mul_and_dynamic_fp8_group_quant_repr = make_kernel_repr(
+    "_act_mul_and_dynamic_fp8_group_quant_kernel",
+    ["ACTIVATION", "BLOCK_SIZE_N", "QUANT_BLOCK_SIZE", "EVEN_N"],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,
     }
 )
-@triton.jit
+@triton.jit(repr=_act_mul_and_dynamic_fp8_group_quant_repr)
 def _act_mul_and_dynamic_fp8_group_quant_kernel(
     x_ptr,
     x_fp8_ptr,
