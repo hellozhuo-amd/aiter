@@ -153,6 +153,7 @@ def act_mul_and_fp8_group_quant(
     activation: Literal["silu", "gelu", "gelu_tanh"],
     group_size,
     dtype_quant=fp8_dtype,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply the activation to the first half of the features, multiply the result by the
@@ -163,6 +164,11 @@ def act_mul_and_fp8_group_quant(
         activation: The activation for the first half: "silu", "gelu" or "gelu_tanh".
         group_size: The number of columns that share one scale.
         dtype_quant: The FP8 dtype of the output.
+        transpose_scale: Store the scales column-major: the bytes are a contiguous
+            (cdiv(N // 2, group_size), M) tensor, returned as an (M, cdiv(N // 2,
+            group_size)) view. This is the layout of
+            ``per_group_quant_hip(transpose_scale=True)``, which the bpreshuffle
+            block-scale GEMMs read.
 
     Returns:
         A tuple of (x_fp8, scales). x_fp8 has the shape (M, N // 2). scales is fp32 with
@@ -181,7 +187,12 @@ def act_mul_and_fp8_group_quant(
     N_half = N // 2
     scaleN = triton.cdiv(N_half, group_size)
     x_fp8 = torch.empty((M, N_half), dtype=dtype_quant, device=x.device)
-    out_bs = torch.empty((M, scaleN), dtype=torch.float32, device=x.device)
+    if transpose_scale:
+        out_bs = torch.empty((scaleN, M), dtype=torch.float32, device=x.device)
+        stride_bs_m, stride_bs_n = out_bs.stride(1), out_bs.stride(0)
+    else:
+        out_bs = torch.empty((M, scaleN), dtype=torch.float32, device=x.device)
+        stride_bs_m, stride_bs_n = out_bs.stride()
 
     DTYPE_MAX = (
         torch.finfo(x_fp8.dtype).max
@@ -201,7 +212,8 @@ def act_mul_and_fp8_group_quant(
         out_bs,
         *x.stride(),
         *x_fp8.stride(),
-        *out_bs.stride(),
+        stride_bs_m,
+        stride_bs_n,
         N=N_half,
         ACTIVATION=activation,
         scaleN=scaleN,
@@ -212,7 +224,7 @@ def act_mul_and_fp8_group_quant(
         **config,
     )
 
-    return x_fp8, out_bs
+    return x_fp8, out_bs.view(M, scaleN)
 
 
 def fused_silu_mul(

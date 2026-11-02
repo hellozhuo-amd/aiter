@@ -204,3 +204,39 @@ def test_act_mul_and_fp8_group_quant_launch(monkeypatch, M: int, N: int):
         return
     for key, value in activation_ops._select_m_leq_config(configs, M).items():
         assert spy.kwargs[key] == value, key
+
+
+@pytest.mark.parametrize("M", [1, 16, 31, 32, 128, 1024, 4336, 16384])
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+def test_act_mul_and_fp8_group_quant_transpose_scale(M: int, activation: str):
+    from aiter import QuantType, get_hip_quant
+
+    torch.manual_seed(0)
+    N = 2 * 21504
+    group_size = 128
+    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+
+    q, s = act_mul_and_fp8_group_quant(x, activation, group_size)
+    q_t, s_t = act_mul_and_fp8_group_quant(
+        x, activation, group_size, transpose_scale=True
+    )
+    G = N // 2 // group_size
+    assert s_t.shape == s.shape == (M, G) and s_t.is_contiguous()
+    assert torch.equal(q_t.view(torch.uint8), q.view(torch.uint8))
+    # Same bytes as the row-major scales, transposed.
+    assert torch.equal(
+        s_t.view(G, M).view(torch.int32), s.t().contiguous().view(torch.int32)
+    )
+
+    # The HIP quant with transpose_scale=True stores the same layout: on a bf16 input
+    # whose group scales are exact powers of two, its scales are the known scale
+    # matrix in the same (G, M) bytes.
+    exp = torch.randint(-8, 8, (M, G, 1), device="cuda").float()
+    vals = torch.empty((M, G, group_size), device="cuda").uniform_(-240, 240)
+    vals = vals.to(q.dtype).float()
+    vals[:, :, 0] = 240.0
+    y = (vals * torch.exp2(exp)).view(M, -1).to(torch.bfloat16)
+    hip_quant = get_hip_quant(QuantType.per_1x128)
+    _, s_hip = hip_quant(y, quant_dtype=q.dtype, transpose_scale=True)
+    assert s_hip.shape == s_t.shape and s_hip.is_contiguous()
+    assert torch.equal(s_hip.view(G, M), torch.exp2(exp).view(M, G).t().contiguous())
