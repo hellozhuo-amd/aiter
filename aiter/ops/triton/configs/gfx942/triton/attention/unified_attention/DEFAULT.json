@@ -21,7 +21,7 @@
   "attn_2d": {
     "D_GEQ_256.Q_LEQ_1.DT_fp8_fp8": {
       "BLOCK_M": 16,
-      "num_warps": 2,
+      "num_warps": 4,
       "num_stages": 2,
       "waves_per_eu": 2,
       "TILE_SIZE_MIN": 32,
