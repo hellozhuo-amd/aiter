@@ -110,6 +110,11 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+    # dynamic per-group fp8 output quant (out is fp8): scales and their (token, group) strides
+    out_block_scale: torch.Tensor | None = None
+    stride_qs_0: int = 0
+    stride_qs_1: int = 0
+    group_size: int = 128
 
 
 def use_2d_kernel(params: _UAParams):
@@ -154,7 +159,20 @@ def unified_attention(
     skip_reduce: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
+    # dynamic per-group fp8 output quant
+    out_block_scale: torch.Tensor | None = None,
+    transpose_scale: bool = False,
+    group_size: int = 128,
 ):
+    """Causal paged attention over a KV cache (2d kernel, or 3d split-KV + reduce).
+
+    out_block_scale: fp32 (M, num_query_heads * head_size // group_size) tensor, M >= q.shape[0]. When given,
+        `out` must be fp8 and receives the attention output quantized per 1 x group_size group of the flattened
+        (num_tokens, num_query_heads * head_size) output, with these scales, bitwise equal to the bf16 output
+        followed by `per_group_quant_hip` (same scale layout: transpose_scale=True stores the scale bytes as a
+        contiguous (G, M) tensor, viewed as (M, G), like `per_group_quant_hip(transpose_scale=True)`).
+        Triton backend only; incompatible with output_scale and skip_reduce.
+    """
     assert causal, "Only causal attention is supported"
 
     if backend is None:
@@ -172,6 +190,20 @@ def unified_attention(
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
+
+    stride_qs_0 = stride_qs_1 = 0
+    if out_block_scale is not None:
+        assert backend == "triton", "fused group quant: Triton backend only"
+        assert output_scale is None and not skip_reduce
+        assert out.dtype == e4m3_dtype, f"fused group quant needs an fp8 output, got {out.dtype}"
+        assert out_block_scale.dtype == torch.float32
+        assert q.shape[2] % group_size == 0, "head_size must be a multiple of group_size"
+        n_groups = q.shape[1] * q.shape[2] // group_size
+        rows = out_block_scale.shape[0]
+        assert out_block_scale.is_contiguous() and out_block_scale.shape == (rows, n_groups)
+        assert rows >= q.shape[0]
+        # transpose_scale: contiguous (G, rows) bytes viewed as (rows, G)
+        stride_qs_0, stride_qs_1 = (1, rows) if transpose_scale else (n_groups, 1)
 
     q_dtype = q.dtype
     kv_cache_dtype = k.dtype
@@ -286,6 +318,10 @@ def unified_attention(
         v_descale=v_descale,
         output_scale=output_scale,
         skip_reduce=skip_reduce,
+        out_block_scale=out_block_scale,
+        stride_qs_0=stride_qs_0,
+        stride_qs_1=stride_qs_1,
+        group_size=group_size,
     )
 
     # if batch contains a prefill
@@ -557,7 +593,20 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        **_group_quant_kwargs(params),
         **config,
+    )
+
+
+def _group_quant_kwargs(params: _UAParams) -> dict:
+    if params.out_block_scale is None:
+        return {}
+    return dict(
+        out_qscale_ptr=params.out_block_scale,
+        stride_qs_0=params.stride_qs_0,
+        stride_qs_1=params.stride_qs_1,
+        GROUP_QUANT=True,
+        QUANT_GROUP_SIZE=params.group_size,
     )
 
 
@@ -638,6 +687,7 @@ def _unified_attention_3d_triton(
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
+        **(_group_quant_kwargs(params) if NUM_SEGMENTS == 1 else {}),
         **config,
     )
 
@@ -671,6 +721,7 @@ def _reduce_segments_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         BLOCK_Q=None,
+        **_group_quant_kwargs(params),
         **config,
     )
 

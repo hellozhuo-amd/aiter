@@ -52,6 +52,53 @@ def find_seq_idx(
     return left - 1
 
 
+@triton.jit
+def store_fp8_group_quant(
+    acc,  # [R, HEAD_SIZE_PADDED] fp32: R (token, q-head) rows of one program
+    output_ptr,  # fp8 output, [num_tokens, num_query_heads, head_size]
+    output_offset,  # [R, HEAD_SIZE_PADDED]
+    output_mask,  # [R, HEAD_SIZE_PADDED]
+    out_qscale_ptr,  # fp32 group scales of the flattened (num_tokens, num_query_heads * head_size) output
+    token_idx,  # [R]
+    head_idx,  # [R]
+    row_mask,  # [R]
+    stride_qs_0,  # scale stride between tokens
+    stride_qs_1,  # scale stride between groups
+    R: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """Dynamic per-group (1 x GROUP_SIZE) fp8 quant of the attention output.
+
+    Same arithmetic as the HIP `dynamic_per_group_scaled_quant_kernel` on the bf16 output the unfused path
+    stores, so the fp8 bytes and fp32 scales are bitwise equal to `attention -> per_group_quant_hip`:
+    round to bf16, amax (floored at 1e-10), scale = amax * f32(1 / FP8_MAX), q = x * (1 / scale).
+    A group never crosses a (token, head) row since HEAD_SIZE % GROUP_SIZE == 0.
+    """
+    GROUPS_PER_HEAD: tl.constexpr = HEAD_SIZE // GROUP_SIZE
+    # Per-group amax by masked row reductions instead of a (R, NUM_GROUPS, GROUP_SIZE) reshape: the reshape
+    # needs a layout conversion that doubled the decode kernel's register spills.
+    x = acc.to(tl.bfloat16).to(tl.float32)
+    ax = tl.abs(x)
+    group_of_col = tl.arange(0, HEAD_SIZE_PADDED) // GROUP_SIZE
+    inv_scale_col = tl.zeros_like(x)
+    scale_row_offset = token_idx.to(tl.int64) * stride_qs_0 + head_idx * GROUPS_PER_HEAD * stride_qs_1
+    for g in tl.static_range(GROUPS_PER_HEAD):
+        in_group = group_of_col[None, :] == g
+        amax = tl.maximum(tl.max(tl.where(in_group, ax, 0.0), axis=1), 1e-10)
+        scale = amax * (1.0 / FP8_MAX)
+        inv_scale_col = tl.where(in_group, (1.0 / scale)[:, None], inv_scale_col)
+        tl.store(out_qscale_ptr + scale_row_offset + g * stride_qs_1, scale, mask=row_mask)
+    q = tl.clamp(x * inv_scale_col, -FP8_MAX, FP8_MAX)
+    tl.store(
+        output_ptr + output_offset,
+        q.to(output_ptr.type.element_ty),
+        mask=output_mask,
+    )
+
+
 _kernel_unified_attention_2d_repr = make_kernel_repr(
     "kernel_unified_attention_2d",
     [
@@ -72,6 +119,7 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "SPLIT_UNMASKED_LOOP",
         "K_WIDTH",
+        "GROUP_QUANT",
     ],
 )
 
@@ -128,6 +176,11 @@ def kernel_unified_attention_2d(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    out_qscale_ptr=None,  # float32, GROUP_QUANT group scales
+    stride_qs_0: tl.int64 = 0,  # scale stride between tokens
+    stride_qs_1: tl.int64 = 0,  # scale stride between groups
+    GROUP_QUANT: tl.constexpr = False,  # bool: dynamic 1 x QUANT_GROUP_SIZE fp8 output
+    QUANT_GROUP_SIZE: tl.constexpr = 128,  # int
 ):
     tl.static_assert(
         not (SPLIT_UNMASKED_LOOP and SHUFFLED_KV_CACHE),
@@ -523,20 +576,39 @@ def kernel_unified_attention_2d(
     if out_scale_ptr is not None:
         acc = acc / tl.load(out_scale_ptr)
 
-    if output_ptr.type.element_ty.is_fp8():
-        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
-
     output_offset = (
         query_offset_0[:, None] * output_stride_0
         + query_offset_1[:, None] * output_stride_1
         + offs_d[None, :]
     )
 
-    tl.store(
-        output_ptr + output_offset,
-        acc,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-    )
+    if GROUP_QUANT:
+        store_fp8_group_quant(
+            acc,
+            output_ptr,
+            output_offset,
+            dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+            out_qscale_ptr,
+            query_offset_0,
+            query_offset_1,
+            query_mask_0 & query_mask_1,
+            stride_qs_0,
+            stride_qs_1,
+            BLOCK_M,
+            HEAD_SIZE,
+            HEAD_SIZE_PADDED,
+            QUANT_GROUP_SIZE,
+            FP8_MAX,
+        )
+    else:
+        if output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
+        tl.store(
+            output_ptr + output_offset,
+            acc,
+            mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        )
 
 
 kernel_unified_attention_3d_repr = make_kernel_repr(
@@ -555,6 +627,7 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "IS_Q_FP8",
         "IS_KV_FP8",
+        "GROUP_QUANT",
     ],
 )
 
@@ -615,6 +688,12 @@ def kernel_unified_attention_3d(
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    out_qscale_ptr=None,  # float32, GROUP_QUANT group scales (NUM_SEGMENTS_PER_SEQ == 1 only)
+    stride_qs_0: tl.int64 = 0,  # scale stride between tokens
+    stride_qs_1: tl.int64 = 0,  # scale stride between groups
+    GROUP_QUANT: tl.constexpr = False,  # bool: dynamic 1 x QUANT_GROUP_SIZE fp8 output
+    QUANT_GROUP_SIZE: tl.constexpr = 128,  # int
+    FP8_MAX: tl.constexpr = float8_info.max,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -932,11 +1011,32 @@ def kernel_unified_attention_3d(
         + segm_idx * HEAD_SIZE_PADDED
         + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
     )
-    tl.store(
-        segm_output_ptr + segm_output_offset,
-        acc,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-    )
+    if GROUP_QUANT:
+        # NUM_SEGMENTS_PER_SEQ == 1: segm_output_ptr is the fp8 output itself
+        tl.static_assert(NUM_SEGMENTS_PER_SEQ == 1)
+        store_fp8_group_quant(
+            acc,
+            segm_output_ptr,
+            segm_output_offset,
+            dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+            out_qscale_ptr,
+            query_offset_0,
+            query_offset_1,
+            query_mask_0 & query_mask_1,
+            stride_qs_0,
+            stride_qs_1,
+            BLOCK_M,
+            HEAD_SIZE,
+            HEAD_SIZE_PADDED,
+            QUANT_GROUP_SIZE,
+            FP8_MAX,
+        )
+    else:
+        tl.store(
+            segm_output_ptr + segm_output_offset,
+            acc,
+            mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        )
     if NUM_SEGMENTS_PER_SEQ > 1:
         segm_offset = (
             query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
@@ -954,6 +1054,7 @@ _reduce_segments_repr = make_kernel_repr(
         "TILE_SIZE",
         "HEAD_SIZE",
         "NUM_SEGMENTS_PER_SEQ",
+        "GROUP_QUANT",
     ],
 )
 
@@ -980,6 +1081,11 @@ def reduce_segments(
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    out_qscale_ptr=None,  # float32, GROUP_QUANT group scales
+    stride_qs_0: tl.int64 = 0,  # scale stride between tokens
+    stride_qs_1: tl.int64 = 0,  # scale stride between groups
+    GROUP_QUANT: tl.constexpr = False,  # bool: dynamic 1 x QUANT_GROUP_SIZE fp8 output
+    QUANT_GROUP_SIZE: tl.constexpr = 128,  # int
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -1046,15 +1152,34 @@ def reduce_segments(
     if out_scale_ptr is not None:
         acc = acc * out_scale
 
-    if output_ptr.type.element_ty.is_fp8():
-        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
-
     # write result
     output_offset = (
         query_token_idx * output_stride_0
         + query_head_idx * output_stride_1
         + tl.arange(0, HEAD_SIZE_PADDED)
     )
-    tl.store(
-        output_ptr + output_offset, acc.to(output_ptr.type.element_ty), mask=dim_mask
-    )
+    if GROUP_QUANT:
+        store_fp8_group_quant(
+            tl.reshape(acc, (1, HEAD_SIZE_PADDED)),
+            output_ptr,
+            tl.reshape(output_offset, (1, HEAD_SIZE_PADDED)),
+            tl.reshape(tl.broadcast_to(dim_mask, (HEAD_SIZE_PADDED,)), (1, HEAD_SIZE_PADDED)),
+            out_qscale_ptr,
+            tl.full((1,), query_token_idx, dtype=tl.int32),
+            tl.full((1,), query_head_idx, dtype=tl.int32),
+            tl.full((1,), 1, dtype=tl.int1),
+            stride_qs_0,
+            stride_qs_1,
+            1,
+            HEAD_SIZE,
+            HEAD_SIZE_PADDED,
+            QUANT_GROUP_SIZE,
+            FP8_MAX,
+        )
+    else:
+        if output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
+        tl.store(
+            output_ptr + output_offset, acc.to(output_ptr.type.element_ty), mask=dim_mask
+        )
