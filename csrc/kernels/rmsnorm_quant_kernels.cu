@@ -15,7 +15,11 @@
 
 namespace aiter {
 
-template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1>
+// POST_ADD_SCALE (with ADD_RESIDUAL = FUSE_QUANT = false): out = (rmsnorm(input) + residual_in) * post_scale[0], the
+// post-norm residual tail of Gemma4 decoder layers. The norm is rounded to DTYPE_I exactly as the plain rmsnorm
+// output (same instance, same reduction), then (h + residual) * scalar runs in fp32 and is rounded once, to nearest
+// even, like the separate torch elementwise kernel, so the result is bitwise equal to rmsnorm + (h + r) * s.
+template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1, bool POST_ADD_SCALE = false>
 __global__ void add_rmsnorm_quant_kernel(
     DTYPE_O* out,
     DTYPE_I* residual_out,
@@ -33,8 +37,14 @@ __global__ void add_rmsnorm_quant_kernel(
     int out_stride,
     int group_size,
     bool shuffle_scale=false,
-    bool emit_e8m0_scale=false)
+    bool emit_e8m0_scale=false,
+    const DTYPE_I* post_scale=nullptr)
     {
+        // bf16 only: with -ffast-math an fp16 build may narrow the fp32 add/mul to fp16 math (double rounding)
+        static_assert(!POST_ADD_SCALE || (!ADD_RESIDUAL && !FUSE_QUANT && num_row == 1 &&
+                                          std::is_same_v<DTYPE_I, DTYPE_O> &&
+                                          std::is_same_v<DTYPE_I, opus::bf16_t>),
+                      "POST_ADD_SCALE is a plain-rmsnorm mode (bf16, one row per block)");
         static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * thread_data_size % 16 == 0 ? 16 : 8;
         static_assert(thread_data_size * sizeof(DTYPE_I) % load_chunk_bytes == 0, "thread_data_size * sizeof(DTYPE_I) must be a multiple of load_chunk_bytes");
         static constexpr int32_t load_vec_size = load_chunk_bytes / sizeof(DTYPE_I);
@@ -79,7 +89,7 @@ __global__ void add_rmsnorm_quant_kernel(
         thread_data_ix2[0] = load_vector_nbytes<DTYPE_I, thread_data_size, load_chunk_bytes, load_aux, interleave, interleave_size>(buffer_i, row_offset);
         auto& thread_data_i = thread_data_ix2[0];
 
-        if constexpr(ADD_RESIDUAL)
+        if constexpr(ADD_RESIDUAL || POST_ADD_SCALE)
         {
             const DTYPE_I* residual_in_ptr = residual_in + idx * static_cast<int64_t>(residual_in_stride);
             auto buffer_residual_in = opus::make_gmem<DTYPE_I>(residual_in_ptr, oob_i * sizeof(DTYPE_I));
@@ -308,6 +318,24 @@ __global__ void add_rmsnorm_quant_kernel(
                 
                 int store_row_offset = std::is_same_v<DTYPE_O, opus::fp4_t>? row_offset / 2 : row_offset;
                 store_vector<DTYPE_O_STORE, float, thread_data_size, RT, interleave, interleave_size, num_load_inst, DTYPE_O>(buffer_out, thread_data_float, store_row_offset, inverted_scale);
+            }
+            else if constexpr(POST_ADD_SCALE)
+            {
+                const float s = static_cast<float>(post_scale[0]);
+                const auto& thread_data_residual_in = thread_data_ix2[1];
+                vec_i thread_data_out;
+                for(int i = 0; i < thread_data_size; i++)
+                {
+                    // the plain rmsnorm output: same DTYPE_I conversion as store_vector
+                    const float h = static_cast<float>(opus::cast<DTYPE_I>(thread_data_float[i]));
+                    const float y = (h + static_cast<float>(thread_data_residual_in[i])) * s;
+                    // round to nearest even, branch-free (opus' rtn_raw branches per element: +1 us per call); the
+                    // NaN quieting is dropped: an arithmetic NaN (0x7fc00000) stays NaN
+                    const uint32_t bits = __builtin_bit_cast(uint32_t, y);
+                    thread_data_out[i] = __builtin_bit_cast(
+                        DTYPE_I, static_cast<uint16_t>((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16));
+                }
+                store_vector<DTYPE_O_STORE, DTYPE_I, thread_data_size, RT, interleave, interleave_size, num_load_inst, DTYPE_I>(buffer_out, thread_data_out, row_offset);
             }
             else
             {
@@ -658,6 +686,62 @@ __global__ void add_rmsnorm_quant_kernel(
         else
         {
             AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
+        }
+    }
+
+// The rmsnorm() instances (block size, elements per thread, interleave) with POST_ADD_SCALE: the norm part must be
+// the same instance as rmsnorm() for the bitwise contract.
+#define RMSNORM_POST_ADD_SCALE_KERNEL_IMPL(BlockSize, thread_data_size) \
+    { \
+    using DTYPE_I = opus::bf16_t; \
+    dim3 grid(m); \
+    dim3 block(BlockSize); \
+    add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_I, BlockSize, thread_data_size, false, false, true, 1, true><<<grid, block, 0, stream>>>( \
+        reinterpret_cast<DTYPE_I*>(out.data_ptr()), nullptr, nullptr, \
+        reinterpret_cast<DTYPE_I*>(input.data_ptr()), reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
+        reinterpret_cast<DTYPE_I*>(weight.data_ptr()), epsilon, gemma_norm, m, n, input_stride, residual_stride, 0, \
+        out_stride, 0, false, false, reinterpret_cast<const DTYPE_I*>(scalar.data_ptr())); \
+    }
+
+    void rmsnorm_post_add_scale(
+        aiter_tensor_t& out,
+        aiter_tensor_t& input,
+        aiter_tensor_t& residual,
+        aiter_tensor_t& weight,
+        aiter_tensor_t& scalar,
+        double epsilon,
+        bool gemma_norm = false
+    )
+    {
+        int n = input.size(1);
+        int m = input.numel() / n;
+        int input_stride = input.stride(0);
+        int residual_stride = residual.stride(0);
+        int out_stride = out.stride(0);
+        AITER_CHECK(out.dtype() == input.dtype() && residual.dtype() == input.dtype() &&
+                        scalar.dtype() == input.dtype() && weight.dtype() == input.dtype(),
+                    __func__, " out, residual, weight and scalar must have the input dtype");
+        AITER_CHECK(input.dtype() == AITER_DTYPE_bf16, __func__, " not support input type: ",
+                    AiterDtype_to_str(input.dtype()));
+        AITER_CHECK(scalar.numel() >= 1, __func__, " scalar must have one element");
+
+        const HipDeviceGuard device_guard(input.device_id);
+        const hipStream_t stream = aiter::getCurrentHIPStream();
+
+        if (n <= 512) {
+            RMSNORM_POST_ADD_SCALE_KERNEL_IMPL(64, 8);
+        } else if (n <= 1024) {
+            RMSNORM_POST_ADD_SCALE_KERNEL_IMPL(128, 8);
+        } else if (n <= 2048) {
+            RMSNORM_POST_ADD_SCALE_KERNEL_IMPL(256, 8);
+        } else if (n <= 4096) {
+            RMSNORM_POST_ADD_SCALE_KERNEL_IMPL(256, 16);
+        } else if (n <= 6144) {
+            RMSNORM_POST_ADD_SCALE_KERNEL_IMPL(256, 24);
+        } else if (n <= 8192) {
+            RMSNORM_POST_ADD_SCALE_KERNEL_IMPL(256, 32);
+        } else {
+            AITER_CHECK(false, __func__, " not support n: ", n);
         }
     }
 }

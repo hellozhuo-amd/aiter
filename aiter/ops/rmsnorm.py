@@ -630,3 +630,39 @@ def rmsnorm(
     epsilon: float,
     gemma_norm: bool = False,
 ) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant", develop=True)
+def rmsnorm_post_add_scale(
+    out: Tensor,
+    input: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    scalar: Tensor,
+    epsilon: float,
+    gemma_norm: bool = False,
+) -> None: ...
+
+
+def rmsnorm2d_fwd_post_add_scale(
+    out: Tensor,
+    input: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    scalar: Tensor,
+    epsilon: float,
+) -> Tensor:
+    """out = (rms_norm(input, weight, epsilon) + residual) * scalar, in one launch.
+
+    The post-norm residual tail of Gemma4 decoder layers. Bitwise equal to `rms_norm` (the same HIP kernel
+    instance) followed by the fp32 elementwise `(h + residual) * scalar` rounded once (as torch / Inductor do).
+    scalar: 1-element tensor on the device (read inside the kernel, so graph-safe). input, residual, weight,
+    scalar and out are bf16; 2-D input, hidden size <= 8192.
+    """
+    assert _use_hip_common(input, 0) and input.dtype == torch.bfloat16, (
+        "rmsnorm2d_fwd_post_add_scale: 2-D bf16 input, hidden <= 8192"
+    )
+    assert residual.shape == input.shape and out.shape == input.shape
+    assert input.stride(-1) == residual.stride(-1) == out.stride(-1) == 1
+    rmsnorm_post_add_scale(out, input, residual, weight, scalar, epsilon)
+    return out

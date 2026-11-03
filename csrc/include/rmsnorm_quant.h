@@ -40,4 +40,14 @@ void rmsnorm(aiter_tensor_t& out,
              double epsilon,
              bool gemma_norm = false);
 
+// out = (rmsnorm(input, weight) + residual) * scalar[0], bitwise equal to rmsnorm() followed by the fp32
+// elementwise (h + residual) * scalar rounded once to nearest even.
+void rmsnorm_post_add_scale(aiter_tensor_t& out,
+                            aiter_tensor_t& input,
+                            aiter_tensor_t& residual,
+                            aiter_tensor_t& weight,
+                            aiter_tensor_t& scalar,
+                            double epsilon,
+                            bool gemma_norm = false);
+
 } // namespace aiter

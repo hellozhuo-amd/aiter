@@ -2538,6 +2538,15 @@ namespace py = pybind11;
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
+    m.def("rmsnorm_post_add_scale",          \
+          &aiter::rmsnorm_post_add_scale,    \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("residual"),               \
+          py::arg("weight"),                 \
+          py::arg("scalar"),                 \
+          py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false);    \
 
 #define GATED_RMSNORM_QUANT_PYBIND                         \
     m.def("gated_rmsnorm_fp8_group_quant",                 \
