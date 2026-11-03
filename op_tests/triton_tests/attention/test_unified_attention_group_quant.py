@@ -122,7 +122,7 @@ def workload(M, kind):
 @pytest.mark.parametrize("layer", ["sliding", "full"])
 @pytest.mark.parametrize(
     "M,kind",
-    [(1, "decode"), (16, "decode"), (31, "decode"), (32, "decode"), (257, "decode"),
+    [(1, "decode"), (16, "decode"), (31, "decode"), (32, "decode"), (257, "decode"), (400, "decode"),
      (1, "prefill"), (31, "prefill"), (257, "prefill"), (4336, "prefill"), (32, "mixed"), (257, "mixed")],
 )
 def test_group_quant_bitwise(M, kind, layer, transpose_scale):
@@ -195,3 +195,27 @@ def test_group_quant_strided_scale():
         s_f = scale.t().contiguous()[:, :T]  # the (G, rows) bytes
         assert torch.equal(s_f.view(torch.int32), s_ref.contiguous().view(torch.int32))
         assert torch.equal(out.view(rows, H * D)[:T].view(torch.uint8), q_ref.view(torch.uint8))
+
+
+def test_group_quant_split_path_used_for_head_512_2d(monkeypatch):
+    """Head 512 on the 2d kernel runs attention (bf16) + group_quant_rows instead of the fused epilogue."""
+    import aiter.ops.triton.attention.unified_attention as m
+
+    calls = []
+    orig = m.group_quant_rows
+
+    class Spy:
+        def __getitem__(self, grid):
+            calls.append(grid)
+            return orig[grid]
+
+    monkeypatch.setattr(m, "group_quant_rows", Spy())
+    L = LAYERS["full"]
+    args = make_inputs(workload(257, "prefill"), L["num_heads"], L["head_size"], L["block_size"])
+    assert_bitwise(run_pair(args, L["window"], True))
+    assert len(calls) == 1
+    calls.clear()
+    L = LAYERS["sliding"]
+    args = make_inputs(workload(257, "prefill"), L["num_heads"], L["head_size"], L["block_size"])
+    assert_bitwise(run_pair(args, L["window"], True))
+    assert not calls

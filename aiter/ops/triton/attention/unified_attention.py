@@ -6,6 +6,7 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
+    group_quant_rows,
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
     reduce_segments,
@@ -531,7 +532,48 @@ def _check_shuffled_tile_lds(params: _UAParams, config: dict):
     )
 
 
+# Head sizes from which the 2d kernel does not run the fused group-quant epilogue: on gfx942 the head-512
+# 2d configs (served KV cache > 2 GB, i.e. 64-bit KV pointers) go from ~480 to ~504 VGPRs with it and the
+# kernel slows down 4-11% (Gemma4-31B full-attention layers: +4 ms per 16k-token prefill chunk and layer
+# when served; +8% for a 512-sequence decode batch), far more than a separate quant costs. There the
+# attention writes bf16 and group_quant_rows (the same epilogue code, 8 heads per program) quantizes it:
+# same bytes, one extra launch, the cost of the unfused path. The split-KV path (3d + reduce_segments, the
+# usual decode path for these layers) keeps the fused epilogue.
+_GROUP_QUANT_SPLIT_MIN_HEAD_SIZE = 512
+
+
+def _split_group_quant_2d(params: _UAParams) -> bool:
+    return (
+        params.out_block_scale is not None
+        and params.head_size >= _GROUP_QUANT_SPLIT_MIN_HEAD_SIZE
+    )
+
+
 def _unified_attention_2d_triton(params: _UAParams):
+    if _split_group_quant_2d(params):
+        out_fp8 = params.out
+        scratch = torch.empty(out_fp8.shape, dtype=torch.bfloat16, device=out_fp8.device)
+        _unified_attention_2d_triton(params._replace(out=scratch, out_block_scale=None))
+        num_tokens, num_heads, head_size = scratch.shape
+        heads_per_program = min(8, triton.next_power_of_2(num_heads))
+        group_quant_rows[(num_tokens, triton.cdiv(num_heads, heads_per_program))](
+            scratch,
+            out_fp8,
+            params.out_block_scale,
+            scratch.stride(0),
+            scratch.stride(1),
+            out_fp8.stride(0),
+            out_fp8.stride(1),
+            params.stride_qs_0,
+            params.stride_qs_1,
+            num_query_heads=num_heads,
+            HEADS_PER_PROGRAM=heads_per_program,
+            HEAD_SIZE=head_size,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            GROUP_SIZE=params.group_size,
+            num_warps=4,
+        )
+        return
     _check_shuffled_page_triton(params)
     config = get_unified_attention_config("attn_2d", params, backend="triton")
     _check_shuffled_tile_lds(params, config)

@@ -80,22 +80,68 @@ def store_fp8_group_quant(
     GROUPS_PER_HEAD: tl.constexpr = HEAD_SIZE // GROUP_SIZE
     # Per-group amax by masked row reductions instead of a (R, NUM_GROUPS, GROUP_SIZE) reshape: the reshape
     # needs a layout conversion that doubled the decode kernel's register spills.
+    # One live tile: each group is scaled in place once its amax is known; later groups' masks exclude it.
     x = acc.to(tl.bfloat16).to(tl.float32)
-    ax = tl.abs(x)
     group_of_col = tl.arange(0, HEAD_SIZE_PADDED) // GROUP_SIZE
-    inv_scale_col = tl.zeros_like(x)
     scale_row_offset = token_idx.to(tl.int64) * stride_qs_0 + head_idx * GROUPS_PER_HEAD * stride_qs_1
     for g in tl.static_range(GROUPS_PER_HEAD):
         in_group = group_of_col[None, :] == g
-        amax = tl.maximum(tl.max(tl.where(in_group, ax, 0.0), axis=1), 1e-10)
+        amax = tl.maximum(tl.max(tl.where(in_group, tl.abs(x), 0.0), axis=1), 1e-10)
         scale = amax * (1.0 / FP8_MAX)
-        inv_scale_col = tl.where(in_group, (1.0 / scale)[:, None], inv_scale_col)
+        x = tl.where(in_group, x * (1.0 / scale)[:, None], x)
         tl.store(out_qscale_ptr + scale_row_offset + g * stride_qs_1, scale, mask=row_mask)
-    q = tl.clamp(x * inv_scale_col, -FP8_MAX, FP8_MAX)
+    q = tl.clamp(x, -FP8_MAX, FP8_MAX)
     tl.store(
         output_ptr + output_offset,
         q.to(output_ptr.type.element_ty),
         mask=output_mask,
+    )
+
+
+@triton.jit
+def group_quant_rows(
+    x_ptr,  # bf16 attention output, [num_tokens, num_query_heads, head_size]
+    output_ptr,  # fp8, same shape
+    out_qscale_ptr,
+    stride_x_0: tl.int64,
+    stride_x_1: tl.int64,
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    stride_qs_0,
+    stride_qs_1,
+    num_query_heads: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    FP8_MAX: tl.constexpr = float8_info.max,
+):
+    """The attention epilogue's group quant as its own kernel (HEADS_PER_PROGRAM (token, head) rows per
+    program), for the configurations where the fused epilogue slows the attention kernel down."""
+    token = tl.program_id(0)
+    heads = tl.program_id(1) * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    head_mask = heads < num_query_heads
+    mask = head_mask[:, None] & (offs_d < HEAD_SIZE)[None, :]
+    x = tl.load(
+        x_ptr + token * stride_x_0 + heads[:, None] * stride_x_1 + offs_d[None, :], mask=mask, other=0.0
+    )
+    store_fp8_group_quant(
+        x.to(tl.float32),
+        output_ptr,
+        token * output_stride_0 + heads[:, None] * output_stride_1 + offs_d[None, :],
+        mask,
+        out_qscale_ptr,
+        tl.full((HEADS_PER_PROGRAM,), token, dtype=tl.int32),
+        heads,
+        head_mask,
+        stride_qs_0,
+        stride_qs_1,
+        HEADS_PER_PROGRAM,
+        HEAD_SIZE,
+        HEAD_SIZE_PADDED,
+        GROUP_SIZE,
+        FP8_MAX,
     )
 
 
