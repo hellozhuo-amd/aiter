@@ -177,3 +177,21 @@ def test_group_quant_determinism():
         r = run_pair(args, L["window"], True)
         assert torch.equal(r[2].view(torch.uint8), first[2].view(torch.uint8))
         assert torch.equal(r[3].view(torch.int32), first[3].view(torch.int32))
+
+
+def test_group_quant_strided_scale():
+    """transpose_scale=False follows the scale strides: an (M, G) tensor with strides (1, M) gets the
+    transposed bytes (how vLLM passes the transposed layout through the attention op)."""
+    L = LAYERS["full"]
+    for M, kind in ((16, "decode"), (257, "prefill")):
+        args = make_inputs(workload(M, kind), L["num_heads"], L["head_size"], L["block_size"])
+        T, H, D = args["q"].shape
+        G = H * D // GROUP
+        rows = T + 3
+        q_ref, s_ref, _, _ = run_pair(args, L["window"], True, rows=rows)
+        out = torch.empty(rows, H, D, device="cuda", dtype=e4m3_dtype)
+        scale = torch.empty_strided((rows, G), (1, rows), device="cuda", dtype=torch.float32)
+        unified_attention(out=out[:T], window_size=L["window"], out_block_scale=scale, **args)
+        s_f = scale.t().contiguous()[:, :T]  # the (G, rows) bytes
+        assert torch.equal(s_f.view(torch.int32), s_ref.contiguous().view(torch.int32))
+        assert torch.equal(out.view(rows, H * D)[:T].view(torch.uint8), q_ref.view(torch.uint8))

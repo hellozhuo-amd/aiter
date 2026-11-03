@@ -170,8 +170,10 @@ def unified_attention(
         `out` must be fp8 and receives the attention output quantized per 1 x group_size group of the flattened
         (num_tokens, num_query_heads * head_size) output, with these scales, bitwise equal to the bf16 output
         followed by `per_group_quant_hip` (same scale layout: transpose_scale=True stores the scale bytes as a
-        contiguous (G, M) tensor, viewed as (M, G), like `per_group_quant_hip(transpose_scale=True)`).
-        Triton backend only; incompatible with output_scale and skip_reduce.
+        contiguous (G, M) tensor, viewed as (M, G), like `per_group_quant_hip(transpose_scale=True)`). With
+        transpose_scale=False the scales follow out_block_scale's strides, so an (M, G) tensor with strides
+        (1, M) also receives the transposed bytes. Triton backend only; incompatible with output_scale and
+        skip_reduce.
     """
     assert causal, "Only causal attention is supported"
 
@@ -200,10 +202,12 @@ def unified_attention(
         assert q.shape[2] % group_size == 0, "head_size must be a multiple of group_size"
         n_groups = q.shape[1] * q.shape[2] // group_size
         rows = out_block_scale.shape[0]
-        assert out_block_scale.is_contiguous() and out_block_scale.shape == (rows, n_groups)
-        assert rows >= q.shape[0]
-        # transpose_scale: contiguous (G, rows) bytes viewed as (rows, G)
-        stride_qs_0, stride_qs_1 = (1, rows) if transpose_scale else (n_groups, 1)
+        assert out_block_scale.shape == (rows, n_groups) and rows >= q.shape[0]
+        if transpose_scale:  # contiguous (G, rows) bytes viewed as (rows, G)
+            assert out_block_scale.is_contiguous()
+            stride_qs_0, stride_qs_1 = 1, rows
+        else:  # the tensor's own strides: (G, 1) row-major, or (1, rows) = the transposed bytes
+            stride_qs_0, stride_qs_1 = out_block_scale.stride()
 
     q_dtype = q.dtype
     kv_cache_dtype = k.dtype
