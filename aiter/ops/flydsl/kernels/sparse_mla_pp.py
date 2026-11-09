@@ -11,12 +11,18 @@ order, so the output is bitwise identical to it. Host wrapper:
   for both QK and PV. Waves 0-3 are group g0, waves 4-7 group g1.
 * Wave (token, h) gathers D-half h of all 16 rows of a KV tile, row per lane: lane
   (r, g) loads 16 B of row idx[r] at d = 256 h + 32 p + 8 g, p = 0..7. Those
-  registers are the QK A operands as loaded. LDS holds the wave's half only for the
-  V^T transpose, in a private 8 KiB region (8 x 8 KiB = the whole 64 KiB).
+  registers are the QK A operands as loaded.
+* The PV operands (V^T) are the same registers transposed. Default
+  (``mfma_transpose``): 16 identity MFMAs per tile, C = K_block @ I^T, exact for
+  bf16. 6 of the 8 Q fragment pairs are parked in LDS to make room for the V^T
+  registers, which then stay live across the V phase. Alternative: write the tile
+  into a private 8 KiB LDS region and read it back transposed (8 x 8 KiB = the
+  whole 64 KiB).
 * Chained schedule, two phases per tile:
-    M(t): PV(t-1) from V^T / P^T registers, QK(t) from the gather registers, and
-          the partial S(t) written into the PEER wave's region. MFMA only.
-    V(t): peer partial read, tile write + V^T reads, gather(t + 2), softmax(t).
+    M(t): PV(t-1) from V^T / P^T registers, QK(t) from the gather registers,
+          [the V^T(t) transposes], and the partial S(t) written into the PEER
+          wave's region. MFMA only, apart from the parked-Q reads.
+    V(t): peer partial read, [tile write + V^T reads], gather(t + 2), softmax(t).
   With ``skew`` g0 runs one phase ahead of g1, so the two groups of each SIMD
   alternate matrix and memory/LDS/VALU work (ping-pong). Without it (``skew=False``)
   the kernel is the lockstep control.
@@ -74,20 +80,34 @@ def _phase_barrier():
 
 
 @lru_cache(maxsize=8)
-def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
+def compile_sparse_mla_pp(
+    has_sink=False, skew=True, setprio=True, mfma_transpose=True, q_lds=6
+):
     """Launcher of the ping-pong kernel; grid = ceil(T / TOKENS_PER_WG) workgroups.
 
     ``skew=False`` is the lockstep 8-wave control (same schedule, no phase offset).
+    ``mfma_transpose`` builds the PV operands with identity MFMAs in the M phase
+    instead of an LDS tile write + transposed read in the V phase. Paged T=16384:
+    0.96x the LDS path (8.03 vs 9.12 M cycles, at 1.29 vs 1.40 GHz). ``q_lds`` Q pairs
+    are parked in LDS; with ``mfma_transpose`` fewer than 6 spill VGPRs.
     """
     HAS_SINK = bool(has_sink)
     SKEW = bool(skew)
     SETPRIO = bool(setprio)
+    MFMA_T = bool(mfma_transpose)
+    T_BATCH = 2  # MFMA_T: QK pairs transposed per batch (2 MFMAs each)
+    # the last Q_LDS of the 8 Q pairs live in LDS, read back at the start of every M phase:
+    # frees 4 VGPR per pair (MFMA_T keeps V^T live across the V phase and needs them)
+    Q_LDS = int(q_lds)
     module_name = (
         f"sparse_mla_pp_sink{int(HAS_SINK)}_skew{int(SKEW)}_prio{int(SETPRIO)}"
+        + ("_mt" if MFMA_T else "")
+        + (f"_ql{Q_LDS}" if Q_LDS else "")
     )
     BIG = 1 << 24
     CHUNKS = HEAD_DIM // VEC
-    REGION = BLOCK_K * HALF  # elements of one wave's private LDS region
+    # elements of one wave's private LDS region: the KV tile, or only the partial S
+    REGION = WAVE * VEC if MFMA_T else BLOCK_K * HALF
 
     def _lds_load(view, n):
         r = fx.make_rmem_tensor(fx.make_layout(n, 1), fx.BFloat16)
@@ -155,6 +175,12 @@ def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
             fx.rocdl.make_buffer_ptr(out_ptr),
             _rowmajor(BIG, NUM_HEADS, 2, PV_GROUPS, 4, 4, H4),
         )
+        # MFMA_T: PV block (pair p, half hf) row i is d = 32 p + 8 (i // 4) + 4 hf + i % 4,
+        # so a lane's two blocks of pair p hold 8 adjacent d: out[t, head, half, p, k-group, 8]
+        out_t = fx.make_view(
+            fx.rocdl.make_buffer_ptr(out_ptr),
+            _rowmajor(BIG, NUM_HEADS, 2, QK_PAIRS, 4, VEC),
+        )
         n_u = fx.Int32(n_unique)
         idx_tiles = fx.zipped_divide(_rowmajor(BIG, n_u), (1, BLOCK_K))
         n_kt = fx.get_scalar(fx.size(fx.get_(fx.get_shape(idx_tiles), [1, 1])))
@@ -172,6 +198,7 @@ def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
         @fx.struct
         class SharedStorage:
             kv: fx.Array[fx.BFloat16, NWAVE * REGION, 16]
+            q: fx.Array[fx.BFloat16, max(1, NWAVE * Q_LDS * WAVE * VEC), 16]
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         regions = _colmajor(REGION, NWAVE)
@@ -197,10 +224,27 @@ def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
         one_f = fx.Float32(arith.constant(1.0, type=T.f32))
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
 
-        q_frags = [
-            _halves(q_g[q_row, lane_row, half, pr, lane_g, None].load(), halves)
-            for pr in range_constexpr(QK_PAIRS)
-        ]
+        # identity B operand: lane (r, g) holds I[r][4 g + e], e = 0..3
+        eye = fx.Vector.from_elements(
+            [
+                (lane_row == lane_g * fx.Int32(4) + fx.Int32(e)).select(one_f, zero_f)
+                for e in range_constexpr(4)
+            ],
+            fx.Float32,
+        ).to(fx.BFloat16)
+        # PV block of the MFMA_T path: (half within the 8 loaded bf16, pair) -> acc index
+        blk_l = _colmajor(HALVES, QK_PAIRS)
+
+        # Q pairs [wave, pair, lane, 8] parked in LDS (each wave reads back only its own)
+        q_park = storage.q.view(_rowmajor(NWAVE, max(1, Q_LDS), WAVE, VEC))
+        Q_REG = QK_PAIRS - Q_LDS
+        q_frags = []
+        for pr in range_constexpr(QK_PAIRS):
+            raw = q_g[q_row, lane_row, half, pr, lane_g, None].load()
+            if const_expr(pr < Q_REG):
+                q_frags.append(_halves(raw, halves))
+            else:
+                q_park[warp, pr - Q_REG, lane, None].store(fx.Vector(raw))
 
         def _load_idx(kt):
             kt = (kt < n_kt).select(kt, fx.Int32(0))
@@ -249,12 +293,12 @@ def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
                     acc[t] = _mfma_ssa(mma, vt[t], p_b, acc[t])
             return acc
 
-        def _qk(frags):
+        def _qk(frags, q_all):
             s_accs = [_zero4() for _ in range_constexpr(HALVES)]
             for pr in range_constexpr(QK_PAIRS):
                 k = _halves(frags[pr], halves)
                 for h in range_constexpr(HALVES):
-                    s_accs[h] = _mfma_ssa(mma, k[h], q_frags[pr][h], s_accs[h])
+                    s_accs[h] = _mfma_ssa(mma, k[h], q_all[pr][h], s_accs[h])
             s_acc = s_accs[0]
             for a in s_accs[1:]:
                 s_acc = fx.Vector.from_elements(
@@ -263,17 +307,49 @@ def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
                 )
             return s_acc
 
+        def _transpose(frags):
+            # C = K_block @ I^T: lane (r, g) gets K[token 4 g + c][d(r)] for c = 0..3, the
+            # PV A layout. x * 1.0 in fp32 is exact, so the bf16 repack is too.
+            # Batches of T_BATCH pairs, each packed before the next is issued: left to the
+            # scheduler, all 16 fp32 results (64 VGPR) are live at once and the kernel spills.
+            ops = [None] * N_ACC
+            for b0 in range_constexpr(0, QK_PAIRS, T_BATCH):
+                cs = []
+                for pr in range_constexpr(b0, b0 + T_BATCH):
+                    k = _halves(frags[pr], halves)
+                    for hf in range_constexpr(HALVES):
+                        cs.append((pr, hf, _mfma_ssa(mma, k[hf], eye, _zero4())))
+                for pr, hf, c in cs:
+                    # the high bf16 of each fp32 is the transposed value
+                    hi = fx.Vector(c).bitcast(fx.BFloat16)
+                    ops[_py(fx.crd2idx((hf, pr), blk_l))] = fx.Vector.from_elements(
+                        [hi[2 * i + 1] for i in range_constexpr(4)], fx.BFloat16
+                    )
+                fx.rocdl.sched_barrier(0)
+            return ops
+
         def _m_phase(acc, vt, p_b, frags):
+            # parked Q pairs: read first, so the PV burst covers the LDS latency
+            q_all = q_frags + [
+                _halves(q_park[warp, j, lane, None].load(), halves)
+                for j in range_constexpr(Q_LDS)
+            ]
             if const_expr(SETPRIO):
                 fx.rocdl.s_setprio(1)
             acc = _pv(acc, vt, p_b)
-            s_acc = _qk(frags)
+            if const_expr(MFMA_T):
+                # PV retires the old V^T operands before the transposes build new ones;
+                # interleaved, both sets (2 x 32 VGPR) are live and the kernel spills
+                fx.rocdl.sched_barrier(0)
+            s_acc = _qk(frags, q_all)
+            if const_expr(MFMA_T):
+                vt = _transpose(frags)
             if const_expr(SETPRIO):
                 fx.rocdl.s_setprio(0)
             part_peer[lane, None].store(fx.Vector(s_acc).bitcast(fx.BFloat16))
             fx.rocdl.s_waitcnt(lgkmcnt=0)
             _phase_barrier()
-            return acc, s_acc
+            return acc, s_acc, vt
 
         def _softmax(s_acc, m_i, l_i, acc):
             scores = [live.select(_elem(s_acc, i), neg_inf) for i in range_constexpr(4)]
@@ -301,9 +377,10 @@ def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
             p_b = fx.Vector.from_elements([_to_bf16(p) for p in p_t], fx.BFloat16)
             return m_n, l_i, acc, p_b
 
-        def _v_phase(t, s_acc, m_i, l_i, acc, frags, idx_s, prefetch):
+        def _v_phase(t, s_acc, m_i, l_i, acc, vt, frags, idx_s, prefetch):
             peer = fx.Vector(part_own[lane, None].load()).bitcast(fx.Float32)
-            _store_tile(frags)
+            if const_expr(not MFMA_T):
+                _store_tile(frags)
             # prefetch is static: a runtime skip would merge a gather-free path into the
             # loop's waitcnt state and drain the next tile's gather one phase early.
             new_frags = frags
@@ -314,7 +391,8 @@ def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
                 [_elem(s_acc, i) + peer[i] for i in range_constexpr(4)], fx.Float32
             )
             m_i, l_i, acc, p_b = _softmax(s_acc, m_i, l_i, acc)
-            vt = _read_vt()
+            if const_expr(not MFMA_T):
+                vt = _read_vt()
             fx.rocdl.s_waitcnt(lgkmcnt=0)
             _phase_barrier()
             return m_i, l_i, acc, p_b, vt, new_frags, idx_s
@@ -362,13 +440,13 @@ def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
             # tiles t0 (slot 0) and t0 + 1 (slot 1); slots keep their registers, so the loop
             # carries no copies of in-flight loads
             m_i, l_i, p_b, idx0, idx1, acc, vt, bufs0, bufs1 = _unflat(state)
-            acc, s_acc = _m_phase(acc, vt, p_b, bufs0)
+            acc, s_acc, vt = _m_phase(acc, vt, p_b, bufs0)
             m_i, l_i, acc, p_b, vt, bufs0, idx0 = _v_phase(
-                t0, s_acc, m_i, l_i, acc, bufs0, idx0, prefetch
+                t0, s_acc, m_i, l_i, acc, vt, bufs0, idx0, prefetch
             )
-            acc, s_acc = _m_phase(acc, vt, p_b, bufs1)
+            acc, s_acc, vt = _m_phase(acc, vt, p_b, bufs1)
             m_i, l_i, acc, p_b, vt, bufs1, idx1 = _v_phase(
-                t0 + fx.Int32(1), s_acc, m_i, l_i, acc, bufs1, idx1, prefetch
+                t0 + fx.Int32(1), s_acc, m_i, l_i, acc, vt, bufs1, idx1, prefetch
             )
             return [m_i, l_i, p_b, idx0, idx1] + acc + vt + bufs0 + bufs1
 
@@ -403,7 +481,18 @@ def compile_sparse_mla_pp(has_sink=False, skew=True, setprio=True):
             denom = denom * alpha_q + sink_term
         denom = (denom > tiny).select(denom, tiny)
         inv = alpha_q / denom
-        if live:
+        if const_expr(MFMA_T):
+            if live:
+                for pr in range_constexpr(QK_PAIRS):
+                    vals = [
+                        _to_bf16(_elem(acc[_py(fx.crd2idx((hf, pr), blk_l))], i) * inv)
+                        for hf in range_constexpr(HALVES)
+                        for i in range_constexpr(4)
+                    ]
+                    out_t[t_idx, head, half, pr, lane_g, None].store(
+                        fx.Vector.from_elements(vals, fx.BFloat16)
+                    )
+        elif live:
             for g in range_constexpr(PV_GROUPS):
                 for i in range_constexpr(4):
                     vals = [

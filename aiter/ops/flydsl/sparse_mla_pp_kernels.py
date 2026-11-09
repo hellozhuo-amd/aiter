@@ -38,6 +38,8 @@ def sparse_mla_pp_fwd_flydsl(
     softmax_scale: float | None = None,
     uniform_topk: int | None = None,
     verify_csr: bool = True,
+    mfma_transpose: bool = True,
+    q_lds: int = 6,
 ):
     """Same contract as sparse_mla_one_query_fwd_flydsl; topk must be a multiple of 32."""
     _require_gfx942()
@@ -53,7 +55,9 @@ def sparse_mla_pp_fwd_flydsl(
     if not (0 < scale < float("inf")):
         raise ValueError("FlyDSL sparse MLA softmax_scale must be finite and positive")
     has_sink = attn_sink is not None
-    kernel = compile_sparse_mla_pp(has_sink)
+    kernel = compile_sparse_mla_pp(
+        has_sink, mfma_transpose=bool(mfma_transpose), q_lds=int(q_lds)
+    )
     n_tiles = -(-n_tok // TOKENS_PER_WG)
     idx = flat.to(dtype=torch.int32).contiguous()
     if has_sink:
