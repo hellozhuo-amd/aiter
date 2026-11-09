@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import functools
 import math
 
 import flydsl.expr as fx
@@ -22,24 +21,6 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 # slot * D and token * H * D are int32 element offsets. Larger shapes fall back.
 _MAX_TOKENS = (1 << 31) // (NUM_HEADS * HEAD_DIM)
 _MAX_KV_ROWS = (1 << 31) // HEAD_DIM
-
-# One-query prefetch schedule, chosen by T (MI300X, idx_ahead / early_gather A/B):
-# with fewer than ~3 WGs per CU each tile's chain is latency-bound and one index tile
-# ahead wins (T=16: 0.81x, T=768: 0.92x); at full occupancy two ahead with the gather
-# before the tile barrier wins (T=1024: 0.91x, paged T=16384: 0.96x). Bitwise identical.
-_ONE_Q_FULL_OCCUPANCY_WGS_PER_CU = 3
-
-
-@functools.lru_cache(maxsize=None)
-def _num_cus(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-def _one_q_schedule(n_tok: int, device) -> dict:
-    if n_tok >= _ONE_Q_FULL_OCCUPANCY_WGS_PER_CU * _num_cus(device.index if device.index is not None else torch.cuda.current_device()):
-        return dict(idx_ahead=2, early_gather=True)
-    return dict(idx_ahead=1, early_gather=True)
-
 
 __all__ = [
     "sparse_mla_one_query_fwd_flydsl",
@@ -189,8 +170,7 @@ def _launch(
     if not (0 < scale < float("inf")):
         raise ValueError("FlyDSL sparse MLA softmax_scale must be finite and positive")
     has_sink = attn_sink is not None
-    sched = _one_q_schedule(n_tok, q.device) if block_q == 1 else {}
-    kernel = compile_sparse_mla_qblock(block_q, has_sink, **sched)
+    kernel = compile_sparse_mla_qblock(block_q, has_sink)
     idx = idx.to(dtype=torch.int32).contiguous()
     if has_sink:
         attn_sink = attn_sink.reshape(-1).to(torch.float32).contiguous()

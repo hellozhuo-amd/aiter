@@ -135,8 +135,8 @@ def _halves(v8, halves):
     ]
 
 
-@lru_cache(maxsize=32)
-def compile_sparse_mla_qblock(block_q, has_sink=False, idx_ahead=None, early_gather=False):
+@lru_cache(maxsize=8)
+def compile_sparse_mla_qblock(block_q, has_sink=False):
     if block_q not in (1, 2, 4):
         raise ValueError("BLOCK_Q must be 1, 2, or 4")
 
@@ -155,14 +155,9 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, idx_ahead=None, early_gat
     NQK = NWARP if ONE_Q else 1
     NPV = NWARP
     QK_BATCH = QK_BATCH_PAIRS_ONE_Q if ONE_Q else QK_BATCH_PAIRS_QBLOCK
-    IDX_AHEAD = (0 if ONE_Q else IDX_AHEAD_QBLOCK) if idx_ahead is None else int(idx_ahead)
-    # one-query with IDX_AHEAD > 0 issues the gather before the index load, so the
-    # tile-top wait leaves that one index load in flight (vmcnt is in order).
-    IDX_AFTER_GATHER = ONE_Q and IDX_AHEAD > 0
-    EARLY_GATHER = bool(early_gather)
+    IDX_AHEAD = 0 if ONE_Q else IDX_AHEAD_QBLOCK
     module_name = (
         f"sparse_mla_mfma_bq{BLOCK_Q}_sink{int(HAS_SINK)}_d{HEAD_DIM}_h{NUM_HEADS}"
-        f"_ia{IDX_AHEAD}_eg{int(EARLY_GATHER)}"
     )
 
     # One-query fits 16 KB (4 CTAs/CU on gfx942): unpadded rows with the 16-B
@@ -397,10 +392,9 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, idx_ahead=None, early_gat
             kt_i32 = fx.Int32(kt)
             kt_next = fx.get_scalar(fx.crd2idx((kt_i32, 1), ahead))
 
-            fx.rocdl.s_waitcnt(vmcnt=1 if const_expr(IDX_AFTER_GATHER) else 0)
+            fx.rocdl.s_waitcnt(vmcnt=0)
             _store_kv(prefetched)
-            if const_expr(not EARLY_GATHER):
-                gpu.barrier()
+            gpu.barrier()
             # Issue the next tile's gather before any LDS read so the bytes
             # stay outstanding across QK, softmax, and PV.
             next_prefetched = prefetched
@@ -408,14 +402,10 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, idx_ahead=None, early_gat
                 idx_q = [_load_idx(kt_next)]
             idx_cur = idx_q[0]
             idx_q = idx_q[1:]
-            if const_expr(IDX_AHEAD > 0 and not IDX_AFTER_GATHER):
+            if const_expr(IDX_AHEAD > 0):
                 idx_q.append(_load_idx(fx.get_scalar(fx.crd2idx((kt_next, IDX_AHEAD), ahead))))
             if kt_next < n_kt:
                 next_prefetched = _gather(idx_cur)
-            if const_expr(IDX_AFTER_GATHER):
-                idx_q.append(_load_idx(fx.get_scalar(fx.crd2idx((kt_next, IDX_AHEAD), ahead))))
-            if const_expr(EARLY_GATHER):
-                gpu.barrier()
             fx.rocdl.sched_barrier(0)
 
             # One accumulator chain per half (tiles 2p and 2p+1), summed after the chain.
