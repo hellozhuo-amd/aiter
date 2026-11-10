@@ -88,6 +88,7 @@ def compile_sparse_mla_pp(
     q_lds=6,
     gather_split=4,
     slp=False,
+    coalesce=True,
 ):
     """Launcher of the ping-pong kernel; grid = ceil(T / TOKENS_PER_WG) workgroups.
 
@@ -112,6 +113,11 @@ def compile_sparse_mla_pp(
     # LLVM SLP vectorization pairs fp32 ops into v_pk_*_f32; a packed op waits for BOTH
     # halves' producers (as in the HSTU kernels, where turning it off was a win)
     SLP = bool(slp)
+    # Gather in a coalescable lane order (the 4 lanes that read one row's 64 B are adjacent),
+    # then ds_bpermute the tile into the MFMA layout. In the MFMA order the 4 lanes of a row
+    # are 16 apart, so the address unit cannot merge them: ~58 L1 tag lookups per load
+    # instead of ~16, and tag-RAM conflicts stall the L1 (TA busy 95%).
+    COALESCE = bool(coalesce)
     if G_SPLIT not in (1, 2, 4):
         raise ValueError(f"gather_split must be 1, 2 or 4, got {G_SPLIT}")
     module_name = (
@@ -121,6 +127,7 @@ def compile_sparse_mla_pp(
         # only non-default values are named, so the default build keeps a stable name
         + (f"_gs{G_SPLIT}" if G_SPLIT != 4 else "")
         + ("_slp" if SLP else "")
+        + ("" if COALESCE else "_nocoal")
     )
     BIG = 1 << 24
     CHUNKS = HEAD_DIM // VEC
@@ -177,6 +184,18 @@ def compile_sparse_mla_pp(
         lane_row = fx.get_(lc, 0).unpack()
         lane_g = fx.get_(lc, 1).unpack()
         head_xor = [_py(fx.crd2idx((0, b), lanes)) for b in (1, 2)]
+        # the lane's gather row and 16-B chunk: MFMA order (row = lane % 16, chunk = lane // 16)
+        # or, COALESCE, load order (row = lane // 4, chunk = lane % 4)
+        if const_expr(COALESCE):
+            lc_ld = fx.idx2crd(lane, _colmajor(4, 16))
+            ld_chunk = fx.get_(lc_ld, 0).unpack()
+            ld_row = fx.get_(lc_ld, 1).unpack()
+            # MFMA lane (r, g) takes load lane 4 r + g; ds_bpermute addresses are bytes
+            perm_addr = fx.get_scalar(
+                fx.crd2idx((lane_g, lane_row), _colmajor(4, 16))
+            ) * fx.Int32(4)
+        else:
+            ld_row, ld_chunk = lane_row, lane_g
         block = fx.Int32(gpu.block_id("x"))
         t_idx = fx.get_scalar(fx.crd2idx((slot, block), _colmajor(TOKENS_PER_WG, BIG)))
         n_tok_i = fx.Int32(n_tok)
@@ -204,7 +223,7 @@ def compile_sparse_mla_pp(
         n_kt = fx.get_scalar(fx.size(fx.get_(fx.get_shape(idx_tiles), [1, 1])))
         idx_lane = fx.make_view(
             fx.rocdl.make_buffer_ptr(idx_ptr), _rowmajor(BLOCK_K, 1)
-        )[lane_row, None]
+        )[ld_row, None]
         idx_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
         kv_g = fx.make_view(
             fx.rocdl.make_buffer_ptr(kv_ptr), _rowmajor(BIG, CHUNKS, VEC)
@@ -273,7 +292,22 @@ def compile_sparse_mla_pp(
             return fx.Int32(fx.Vector(r.load())[0])
 
         def _chunk(pr):
-            return fx.get_scalar(fx.crd2idx((half, pr, lane_g), g_chunks))
+            return fx.get_scalar(fx.crd2idx((half, pr, ld_chunk), g_chunks))
+
+        def _to_mfma(frags):
+            # load order -> MFMA order, one ds_bpermute per dword (in place: the value is
+            # read at issue)
+            out = []
+            for v in frags:
+                d = fx.Vector(v).bitcast(fx.Int32)
+                moved = [
+                    fx.Int32(fx.rocdl.ds_bpermute(T.i32, perm_addr, fx.Int32(d[i])))
+                    for i in range_constexpr(4)
+                ]
+                out.append(
+                    fx.Vector.from_elements(moved, fx.Int32).bitcast(fx.BFloat16)
+                )
+            return out
 
         def _gather(idx_v):
             return [
@@ -347,6 +381,9 @@ def compile_sparse_mla_pp(
             return ops
 
         def _m_phase(acc, vt, p_b, frags):
+            if const_expr(COALESCE):
+                # issued before the PV burst, which covers their latency
+                frags = _to_mfma(frags)
             # parked Q pairs: read first, so the PV burst covers the LDS latency
             q_all = q_frags + [
                 _halves(q_park[warp, j, lane, None].load(), halves)
