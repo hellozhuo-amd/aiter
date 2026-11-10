@@ -51,7 +51,8 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--gpu", type=int, default=0, help="HIP_VISIBLE_DEVICES for the run")
+    p.add_argument("--gpu", type=int, default=None,
+                   help="HIP_VISIBLE_DEVICES for the run (default: inherit it, else 0)")  # fmt: skip
     p.add_argument("-t", "--tokens", type=int, nargs="+", default=[16384])
     p.add_argument("--topk", type=int, default=2048)
     p.add_argument("--groups", type=int, nargs="+", default=[1], choices=[1, 2, 4],
@@ -85,6 +86,9 @@ def parse_args(argv=None):
         "--check-tokens", type=int, default=128, help="0 = skip the oracle check"
     )
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--kernels", nargs="+", choices=["triton", "fly_one_q", "fly_pp", "fly_bq2", "fly_bq4"],
+                   help="run only these rows (default: every applicable kernel); e.g. --kernels fly_pp "
+                        "for a trace capture that runs nothing else")  # fmt: skip
     p.add_argument("--meta", action=argparse.BooleanOptionalAction, default=True,
                    help="print the compiled resources first")  # fmt: skip
     p.add_argument(
@@ -126,10 +130,9 @@ def print_meta(args):
     ]
     with tempfile.TemporaryDirectory(prefix="spmla_meta_") as tmp:
         env = dict(os.environ, FLYDSL_DUMP_IR="1", FLYDSL_DUMP_DIR=f"{tmp}/isa",
-                   FLYDSL_RUNTIME_CACHE_DIR=f"{tmp}/cache", HIP_VISIBLE_DEVICES=str(args.gpu))  # fmt: skip
-        cmd = [sys.executable, __file__, "--stats-only", *names] + (
-            ["--mix"] if args.mix else []
-        )
+                   FLYDSL_RUNTIME_CACHE_DIR=f"{tmp}/cache")  # fmt: skip
+        cmd = [sys.executable, __file__, "--stats-only", *names]
+        cmd += ["--mix"] if args.mix else []
         r = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
         out = "\n".join(
             ln for ln in r.stdout.splitlines() if not ln.startswith("[flydsl.compile]")
@@ -485,6 +488,8 @@ def run_bench(args):
                 for bq in (2, 4)
                 if g % bq == 0
             ]
+            if args.kernels:
+                runs = [r for r in runs if r[1] in args.kernels]
             for bq, name, make in runs:
                 fn = make(q, kv, idx, indptr, sink, args.topk, scale)
                 if fn is None:
@@ -523,7 +528,9 @@ def main():
     if args.stats_only is not None:  # meta subprocess: env already set by print_meta
         stats_only(args.stats_only, args.mix)
         return
-    os.environ["HIP_VISIBLE_DEVICES"] = str(args.gpu)
+    if args.gpu is not None:
+        os.environ["HIP_VISIBLE_DEVICES"] = str(args.gpu)
+    gpu = os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
 
     def git(*a):
         r = subprocess.run(
@@ -535,7 +542,7 @@ def main():
         return r.stdout.strip() or "?"
 
     print(
-        f"using GPU {args.gpu}   branch {git('rev-parse', '--abbrev-ref', 'HEAD')} @ {git('rev-parse', '--short', 'HEAD')}"
+        f"using GPU {gpu}   branch {git('rev-parse', '--abbrev-ref', 'HEAD')} @ {git('rev-parse', '--short', 'HEAD')}"
     )
     print()
     if args.meta:

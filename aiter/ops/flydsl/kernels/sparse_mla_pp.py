@@ -81,7 +81,13 @@ def _phase_barrier():
 
 @lru_cache(maxsize=8)
 def compile_sparse_mla_pp(
-    has_sink=False, skew=True, setprio=True, mfma_transpose=True, q_lds=6
+    has_sink=False,
+    skew=True,
+    setprio=True,
+    mfma_transpose=True,
+    q_lds=6,
+    gather_split=4,
+    slp=False,
 ):
     """Launcher of the ping-pong kernel; grid = ceil(T / TOKENS_PER_WG) workgroups.
 
@@ -99,10 +105,22 @@ def compile_sparse_mla_pp(
     # the last Q_LDS of the 8 Q pairs live in LDS, read back at the start of every M phase:
     # frees 4 VGPR per pair (MFMA_T keeps V^T live across the V phase and needs them)
     Q_LDS = int(q_lds)
+    # The 8 gather loads of a V phase in G_SPLIT chunks spread through the softmax.
+    # One burst per wave makes the 4 waves of a group queue for the CU's one vector
+    # memory pipe while their VALU waits behind the stalled load.
+    G_SPLIT = int(gather_split)
+    # LLVM SLP vectorization pairs fp32 ops into v_pk_*_f32; a packed op waits for BOTH
+    # halves' producers (as in the HSTU kernels, where turning it off was a win)
+    SLP = bool(slp)
+    if G_SPLIT not in (1, 2, 4):
+        raise ValueError(f"gather_split must be 1, 2 or 4, got {G_SPLIT}")
     module_name = (
         f"sparse_mla_pp_sink{int(HAS_SINK)}_skew{int(SKEW)}_prio{int(SETPRIO)}"
         + ("_mt" if MFMA_T else "")
         + (f"_ql{Q_LDS}" if Q_LDS else "")
+        # only non-default values are named, so the default build keeps a stable name
+        + (f"_gs{G_SPLIT}" if G_SPLIT != 4 else "")
+        + ("_slp" if SLP else "")
     )
     BIG = 1 << 24
     CHUNKS = HEAD_DIM // VEC
@@ -351,11 +369,19 @@ def compile_sparse_mla_pp(
             _phase_barrier()
             return acc, s_acc, vt
 
-        def _softmax(s_acc, m_i, l_i, acc):
+        def _at(hooks, point):
+            # a gather chunk pinned at this point of the softmax (G_SPLIT > 1)
+            if const_expr(point in hooks):
+                fx.rocdl.sched_barrier(0)
+                hooks[point]()
+                fx.rocdl.sched_barrier(0)
+
+        def _softmax(s_acc, m_i, l_i, acc, hooks):
             scores = [live.select(_elem(s_acc, i), neg_inf) for i in range_constexpr(4)]
             m_w = scores[0]
             for i in range_constexpr(1, 4):
                 m_w = (m_w > scores[i]).select(m_w, scores[i])
+            _at(hooks, 1)
             moved = fx.Int64(
                 fx.rocdl.ballot(
                     fx.Int64.ir_type, (m_w - m_i) * qk_scale > fx.Float32(RESCALE_TAU)
@@ -368,12 +394,14 @@ def compile_sparse_mla_pp(
                 m_n = (m_h > m_i).select(m_h, m_i)
                 alpha = (m_n == neg_inf).select(zero_f, _exp2((m_i - m_n) * qk_scale))
                 acc = _rescale_all(acc, alpha)
+            _at(hooks, 2)
             empty = m_n == neg_inf
             p_t = []
             for i in range_constexpr(4):
                 p = empty.select(zero_f, _exp2((scores[i] - m_n) * qk_scale))
                 p_t.append(live.select(p, zero_f))
             l_i = l_i * alpha + ((p_t[0] + p_t[1]) + (p_t[2] + p_t[3]))
+            _at(hooks, 3)
             p_b = fx.Vector.from_elements([_to_bf16(p) for p in p_t], fx.BFloat16)
             return m_n, l_i, acc, p_b
 
@@ -384,13 +412,36 @@ def compile_sparse_mla_pp(
             # prefetch is static: a runtime skip would merge a gather-free path into the
             # loop's waitcnt state and drain the next tile's gather one phase early.
             new_frags = frags
-            if const_expr(prefetch):
+            hooks = {}
+            if const_expr(prefetch and G_SPLIT == 1):
                 new_frags = _gather(idx_s)
                 idx_s = _load_idx(t + fx.Int32(4))
+            elif const_expr(prefetch):
+                # chunk c of the 8 loads at softmax point POINTS[c]; the index load
+                # (tile t + 4) stays last so the M-phase vmcnt counts keep their meaning
+                per = QK_PAIRS // G_SPLIT
+                points = (0, 3) if G_SPLIT == 2 else (0, 1, 2, 3)
+                got = {}
+                idx_cur = idx_s
+
+                def _chunk_loads(c):
+                    def go():
+                        for pr in range_constexpr(c * per, (c + 1) * per):
+                            got[pr] = kv_g[idx_cur, _chunk(pr), None].load()
+                        if const_expr(c == G_SPLIT - 1):
+                            got["idx"] = _load_idx(t + fx.Int32(4))
+
+                    return go
+
+                hooks = {pt: _chunk_loads(c) for c, pt in enumerate(points)}
+            _at(hooks, 0)
             s_acc = fx.Vector.from_elements(
                 [_elem(s_acc, i) + peer[i] for i in range_constexpr(4)], fx.Float32
             )
-            m_i, l_i, acc, p_b = _softmax(s_acc, m_i, l_i, acc)
+            m_i, l_i, acc, p_b = _softmax(s_acc, m_i, l_i, acc, hooks)
+            if const_expr(prefetch and G_SPLIT > 1):
+                new_frags = [got[pr] for pr in range_constexpr(QK_PAIRS)]
+                idx_s = got["idx"]
             if const_expr(not MFMA_T):
                 vt = _read_vt()
             fx.rocdl.s_waitcnt(lgkmcnt=0)
@@ -474,11 +525,14 @@ def compile_sparse_mla_pp(
             sink = fx.make_view(
                 fx.rocdl.make_buffer_ptr(sink_ptr), fx.make_layout(NUM_HEADS, 1)
             )[head]
-            m_scaled = m_i * fx.Float32(scale)
-            m_final = (sink > m_scaled).select(sink, m_scaled)
-            alpha_q = _exp2((m_scaled - m_final) * fx.Float32(LOG2E))
-            sink_term = _exp2((sink - m_final) * fx.Float32(LOG2E))
-            denom = denom * alpha_q + sink_term
+            # no `contract`: with SLP off the backend would fuse m_i * scale - m_final into
+            # one FMA (one rounding), unlike the one-query kernel; keep the two roundings
+            with arith.fastmath(arith.FastMathFlags.none):
+                m_scaled = m_i * fx.Float32(scale)
+                m_final = (sink > m_scaled).select(sink, m_scaled)
+                alpha_q = _exp2((m_scaled - m_final) * fx.Float32(LOG2E))
+                sink_term = _exp2((sink - m_final) * fx.Float32(LOG2E))
+                denom = denom * alpha_q + sink_term
         denom = (denom > tiny).select(denom, tiny)
         inv = alpha_q / denom
         if const_expr(MFMA_T):
@@ -531,6 +585,7 @@ def compile_sparse_mla_pp(
         "llvm_options": {
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+            "vectorize-slp": SLP,
         },
     }
     return launch_sparse_mla_pp
