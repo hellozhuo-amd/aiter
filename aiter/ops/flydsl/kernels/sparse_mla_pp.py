@@ -22,7 +22,8 @@ order, so the output is bitwise identical to it. Host wrapper:
     M(t): PV(t-1) from V^T / P^T registers, QK(t) from the gather registers,
           [the V^T(t) transposes], and the partial S(t) written into the PEER
           wave's region. MFMA only, apart from the parked-Q reads.
-    V(t): peer partial read, [tile write + V^T reads], gather(t + 2), softmax(t).
+    V(t): peer partial read, [tile write + V^T reads], gather(t + 1), softmax(t)
+          (gather(t + 2) with ``prefetch_depth=2``).
   With ``skew`` g0 runs one phase ahead of g1, so the two groups of each SIMD
   alternate matrix and memory/LDS/VALU work (ping-pong). Without it (``skew=False``)
   the kernel is the lockstep control.
@@ -116,6 +117,7 @@ def compile_sparse_mla_pp(
     slp=False,
     coalesce=True,
     interleave_bp=True,
+    prefetch_depth=1,
 ):
     """Launcher of the ping-pong kernel; grid = ceil(T / TOKENS_PER_WG) workgroups.
 
@@ -151,6 +153,16 @@ def compile_sparse_mla_pp(
     # instead of ~16, and tag-RAM conflicts stall the L1 (TA busy 95%).
     COALESCE = bool(coalesce)
     INTER_BP = COALESCE and MFMA_T and bool(interleave_bp)
+    # Tiles between a gather and its M phase: 1 (default) = gather(t + 1) in V(t) into the
+    # buffer M(t) just drained; 2 = gather(t + 2) in V(t), one register buffer per slot
+    # (+32 VGPR). The L1's outstanding misses are full at either depth (the extra requests
+    # only queue), yet depth 1 is 0.98x on paged T=16384. Index loads run PD + 2 tiles ahead.
+    PD = int(prefetch_depth)
+    if PD not in (1, 2):
+        raise ValueError(f"prefetch_depth must be 1 or 2, got {PD}")
+    IDX_AHEAD = PD + 2
+    # the last trip (tiles n - 2, n - 1): V(n - 2 + s) gathers n - 2 + s + PD iff that exists
+    LAST_PREFETCH = tuple(s + PD < 2 for s in range(2))
     if G_SPLIT not in (1, 2, 4):
         raise ValueError(f"gather_split must be 1, 2 or 4, got {G_SPLIT}")
     # only non-default values are named, so the default build is plain "sparse_mla_pp"
@@ -166,6 +178,7 @@ def compile_sparse_mla_pp(
         + ("_slp" if SLP else "")
         + ("" if COALESCE else "_nocoal")
         + ("" if INTER_BP or not (COALESCE and MFMA_T) else "_nointer")
+        + (f"_pd{PD}" if PD != 1 else "")
     )
     BIG = 1 << 24
     CHUNKS = HEAD_DIM // VEC
@@ -548,10 +561,10 @@ def compile_sparse_mla_pp(
             hooks = {}
             if const_expr(prefetch and G_SPLIT == 1):
                 new_frags = _gather(idx_s)
-                idx_s = _load_idx(t + fx.Int32(4))
+                idx_s = _load_idx(t + fx.Int32(IDX_AHEAD))
             elif const_expr(prefetch):
                 # chunk c of the 8 loads at softmax point POINTS[c]; the index load
-                # (tile t + 4) stays last so the M-phase vmcnt counts keep their meaning
+                # (tile t + IDX_AHEAD) stays last so the M-phase vmcnt counts keep their meaning
                 per = QK_PAIRS // G_SPLIT
                 points = (0, 3) if G_SPLIT == 2 else (0, 1, 2, 3)
                 got = {}
@@ -562,7 +575,7 @@ def compile_sparse_mla_pp(
                         for pr in range_constexpr(c * per, (c + 1) * per):
                             got[pr] = kv_g[idx_cur, _chunk(pr), None].load()
                         if const_expr(c == G_SPLIT - 1):
-                            got["idx"] = _load_idx(t + fx.Int32(4))
+                            got["idx"] = _load_idx(t + fx.Int32(IDX_AHEAD))
 
                     return go
 
@@ -591,20 +604,29 @@ def compile_sparse_mla_pp(
             for _ in range_constexpr(N_ACC)
         ]
         p_b = fx.Vector.filled(4, 0.0, fx.Float32).to(fx.BFloat16)
-        # Same issue order as the loop (gather t, index t + 2, gather t + 1, index t + 3):
-        # the loop's waits are merged with the prologue's, and vmcnt counts in order.
-        i0 = _load_idx(fx.Int32(0))
-        i1 = _load_idx(fx.Int32(1))
-        bufs0 = _gather(i0)
-        idx0 = _load_idx(fx.Int32(2))
-        bufs1 = _gather(i1)
-        idx1 = _load_idx(fx.Int32(3))
+        # idxs[j] holds the index of the next tile = j (mod 2) to gather: PD + 0 / PD + 1
+        if const_expr(PD == 2):
+            # Same issue order as the loop (gather t, index t + 2, gather t + 1, index t + 3):
+            # the loop's waits are merged with the prologue's, and vmcnt counts in order.
+            i0 = _load_idx(fx.Int32(0))
+            i1 = _load_idx(fx.Int32(1))
+            bufs0 = _gather(i0)
+            idx0 = _load_idx(fx.Int32(2))
+            bufs1 = _gather(i1)
+            idx1 = _load_idx(fx.Int32(3))
+            bufs = [bufs0, bufs1]
+        else:
+            i0 = _load_idx(fx.Int32(0))
+            idx1 = _load_idx(fx.Int32(1))
+            bufs = [_gather(i0)]
+            idx0 = _load_idx(fx.Int32(2))
         # const_expr is resolved at trace time, is_g0 at run time: the two cannot be one `if`
         if const_expr(SKEW):  # noqa: SIM102
             if is_g0:
                 _phase_barrier()
 
         NB = QK_PAIRS
+        NBUF = PD
 
         NS = 5
 
@@ -613,34 +635,35 @@ def compile_sparse_mla_pp(
             rest = state[NS:]
             acc = [fx.Vector(a) for a in rest[:N_ACC]]
             vt = [fx.Vector(a) for a in rest[N_ACC : 2 * N_ACC]]
-            bufs0 = [fx.Vector(a) for a in rest[2 * N_ACC : 2 * N_ACC + NB]]
-            bufs1 = [fx.Vector(a) for a in rest[2 * N_ACC + NB :]]
+            bufs = [
+                [fx.Vector(a) for a in rest[2 * N_ACC + b * NB : 2 * N_ACC + (b + 1) * NB]]
+                for b in range_constexpr(NBUF)
+            ]
             return [
-                fx.Float32(m_i), fx.Float32(l_i), fx.Vector(p_b), fx.Int32(idx0), fx.Int32(idx1),
-                acc, vt, bufs0, bufs1,
+                fx.Float32(m_i), fx.Float32(l_i), fx.Vector(p_b), [fx.Int32(idx0), fx.Int32(idx1)],
+                acc, vt, bufs,
             ]  # fmt: skip
 
         def _trip(t0, state, prefetch):
-            # tiles t0 (slot 0) and t0 + 1 (slot 1); slots keep their registers, so the loop
-            # carries no copies of in-flight loads
-            m_i, l_i, p_b, idx0, idx1, acc, vt, bufs0, bufs1 = _unflat(state)
-            acc, s_acc, vt = _m_phase(acc, vt, p_b, bufs0)
-            m_i, l_i, acc, p_b, vt, bufs0, idx0 = _v_phase(
-                t0, s_acc, m_i, l_i, acc, vt, bufs0, idx0, prefetch
-            )
-            acc, s_acc, vt = _m_phase(acc, vt, p_b, bufs1)
-            m_i, l_i, acc, p_b, vt, bufs1, idx1 = _v_phase(
-                t0 + fx.Int32(1), s_acc, m_i, l_i, acc, vt, bufs1, idx1, prefetch
-            )
-            return [m_i, l_i, p_b, idx0, idx1] + acc + vt + bufs0 + bufs1
+            # tiles t0 (slot 0) and t0 + 1 (slot 1). PD = 2: each slot keeps its own buffer;
+            # PD = 1: V(t) gathers t + 1 into the buffer M(t) drained. Either way the
+            # registers return to place after the trip: the loop carries no copies of
+            # in-flight loads. prefetch[s]: whether V(t0 + s) gathers.
+            m_i, l_i, p_b, idxs, acc, vt, bufs = _unflat(state)
+            for s in range_constexpr(2):
+                b, j = s % NBUF, (s + PD) % 2
+                acc, s_acc, vt = _m_phase(acc, vt, p_b, bufs[b])
+                m_i, l_i, acc, p_b, vt, bufs[b], idxs[j] = _v_phase(
+                    t0 + fx.Int32(s), s_acc, m_i, l_i, acc, vt, bufs[b], idxs[j], prefetch[s]
+                )
+            return [m_i, l_i, p_b] + idxs + acc + vt + [v for bb in bufs for v in bb]
 
-        loop_init = [m_i, l_i, p_b, idx0, idx1] + acc + vt + bufs0 + bufs1
+        loop_init = [m_i, l_i, p_b, idx0, idx1] + acc + vt + [v for bb in bufs for v in bb]
         last = n_kt - fx.Int32(2)
         for kt, state in range(fx.Int32(0), last, fx.Int32(2), init=loop_init):
-            results = yield _trip(fx.Int32(kt), state, True)
-        # the last two tiles: nothing left to prefetch
-        m_i, l_i, p_b, _i0, _i1, acc, vt, _b0, _b1 = _unflat(
-            _trip(last, list(results), False)
+            results = yield _trip(fx.Int32(kt), state, (True, True))
+        m_i, l_i, p_b, _idxs, acc, vt, _bufs = _unflat(
+            _trip(last, list(results), LAST_PREFETCH)
         )
         # the last tile's PV (the M phase the rotation left over)
         acc = _pv(acc, vt, p_b)
