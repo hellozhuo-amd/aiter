@@ -79,6 +79,32 @@ def _phase_barrier():
     fx.rocdl.sched_barrier(0)
 
 
+def _bp_mfma_schedule(pv_blocks, qk_pairs, halves):
+    """interleave_bp: static issue order of M's ds_bpermute and PV / QK MFMAs.
+
+    Returns ("bp", k) (k-th bpermute: pair k // 4, dword k % 4), ("pv", g, h) and
+    ("qk", pair, h) entries: one bpermute before each MFMA, plus whatever a QK still needs
+    of its own pair. Plain Python (outside the kernel: the AST rewriter would turn its
+    while loops into scf.while).
+    """
+    acts, bi, nbp = [], 0, 4 * qk_pairs
+    mm = [("pv",) + b for b in pv_blocks]
+    mm += [("qk", pr, h) for pr in range(qk_pairs) for h in range(halves)]
+    for it in mm:
+        if bi < nbp:
+            acts.append(("bp", bi))
+            bi += 1
+        need = 0 if it[0] == "pv" else 4 * it[1] + 4
+        while bi < need:
+            acts.append(("bp", bi))
+            bi += 1
+        acts.append(it)
+    while bi < nbp:
+        acts.append(("bp", bi))
+        bi += 1
+    return acts
+
+
 @lru_cache(maxsize=8)
 def compile_sparse_mla_pp(
     has_sink=False,
@@ -89,8 +115,14 @@ def compile_sparse_mla_pp(
     gather_split=4,
     slp=False,
     coalesce=True,
+    interleave_bp=True,
 ):
     """Launcher of the ping-pong kernel; grid = ceil(T / TOKENS_PER_WG) workgroups.
+
+    ``interleave_bp`` (default; coalesce + mfma_transpose): M issues its parked-Q reads,
+    then one sched_barrier-pinned stream that alternates the 32 ds_bpermute of K with the
+    16 PV + 16 QK MFMAs (bpermute -> MFMA -> bpermute -> ...; a QK waits only for its own
+    pair's 4 bpermutes), then the transposes; off, all bpermutes go out before the MFMAs.
 
     ``skew=False`` is the lockstep 8-wave control (same schedule, no phase offset).
     ``mfma_transpose`` builds the PV operands with identity MFMAs in the M phase
@@ -118,16 +150,22 @@ def compile_sparse_mla_pp(
     # are 16 apart, so the address unit cannot merge them: ~58 L1 tag lookups per load
     # instead of ~16, and tag-RAM conflicts stall the L1 (TA busy 95%).
     COALESCE = bool(coalesce)
+    INTER_BP = COALESCE and MFMA_T and bool(interleave_bp)
     if G_SPLIT not in (1, 2, 4):
         raise ValueError(f"gather_split must be 1, 2 or 4, got {G_SPLIT}")
+    # only non-default values are named, so the default build is plain "sparse_mla_pp"
+    # (the WaveScope profile's kernelRegex ^sparse_mla_pp$)
     module_name = (
-        f"sparse_mla_pp_sink{int(HAS_SINK)}_skew{int(SKEW)}_prio{int(SETPRIO)}"
-        + ("_mt" if MFMA_T else "")
-        + (f"_ql{Q_LDS}" if Q_LDS else "")
-        # only non-default values are named, so the default build keeps a stable name
+        "sparse_mla_pp"
+        + ("_sink" if HAS_SINK else "")
+        + ("" if SKEW else "_noskew")
+        + ("" if SETPRIO else "_noprio")
+        + ("" if MFMA_T else "_nomt")
+        + (f"_ql{Q_LDS}" if Q_LDS != 6 else "")
         + (f"_gs{G_SPLIT}" if G_SPLIT != 4 else "")
         + ("_slp" if SLP else "")
         + ("" if COALESCE else "_nocoal")
+        + ("" if INTER_BP or not (COALESCE and MFMA_T) else "_nointer")
     )
     BIG = 1 << 24
     CHUNKS = HEAD_DIM // VEC
@@ -380,7 +418,65 @@ def compile_sparse_mla_pp(
                 fx.rocdl.sched_barrier(0)
             return ops
 
+        def _m_phase_bp(acc, vt, p_b, frags):
+            # interleave_bp: Q reads, then bpermute / MFMA alternating, then transposes
+            q_all = q_frags + [
+                _halves(q_park[warp, j, lane, None].load(), halves)
+                for j in range_constexpr(Q_LDS)
+            ]
+            fx.rocdl.sched_barrier(0)
+            if const_expr(SETPRIO):
+                fx.rocdl.s_setprio(1)
+            dw = [fx.Vector(v).bitcast(fx.Int32) for v in frags]
+            moved = [[None] * 4 for _ in range_constexpr(QK_PAIRS)]
+            acc = list(acc)
+            s_accs = [_zero4() for _ in range_constexpr(HALVES)]
+            kops = [None] * QK_PAIRS
+            sched = _bp_mfma_schedule(
+                [(g, h) for g in range(PV_GROUPS) for h in range(H4)], QK_PAIRS, HALVES
+            )
+            for n in range_constexpr(len(sched)):
+                act = sched[n]
+                if const_expr(act[0] == "bp"):
+                    pr, i = act[1] // 4, act[1] % 4
+                    moved[pr][i] = fx.Int32(
+                        fx.rocdl.ds_bpermute(T.i32, perm_addr, fx.Int32(dw[pr][i]))
+                    )
+                elif const_expr(act[0] == "pv"):
+                    t = _py(fx.crd2idx((act[2], act[1]), acc_l))
+                    acc[t] = _mfma_ssa(mma, vt[t], p_b, acc[t])
+                else:
+                    pr, h = act[1], act[2]
+                    if const_expr(kops[pr] is None):
+                        kops[pr] = _halves(
+                            fx.Vector.from_elements(moved[pr], fx.Int32).bitcast(
+                                fx.BFloat16
+                            ),
+                            halves,
+                        )
+                    s_accs[h] = _mfma_ssa(mma, kops[pr][h], q_all[pr][h], s_accs[h])
+                fx.rocdl.sched_barrier(0)
+            s_acc = s_accs[0]
+            for a in s_accs[1:]:
+                s_acc = fx.Vector.from_elements(
+                    [_elem(s_acc, i) + _elem(a, i) for i in range_constexpr(4)],
+                    fx.Float32,
+                )
+            frags = [
+                fx.Vector.from_elements(moved[pr], fx.Int32).bitcast(fx.BFloat16)
+                for pr in range_constexpr(QK_PAIRS)
+            ]
+            vt = _transpose(frags)
+            if const_expr(SETPRIO):
+                fx.rocdl.s_setprio(0)
+            part_peer[lane, None].store(fx.Vector(s_acc).bitcast(fx.BFloat16))
+            fx.rocdl.s_waitcnt(lgkmcnt=0)
+            _phase_barrier()
+            return acc, s_acc, vt
+
         def _m_phase(acc, vt, p_b, frags):
+            if const_expr(INTER_BP):
+                return _m_phase_bp(acc, vt, p_b, frags)
             if const_expr(COALESCE):
                 # issued before the PV burst, which covers their latency
                 frags = _to_mfma(frags)
