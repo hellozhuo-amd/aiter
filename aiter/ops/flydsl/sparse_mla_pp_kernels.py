@@ -44,6 +44,7 @@ def sparse_mla_pp_fwd_flydsl(
     slp: bool = False,
     coalesce: bool = True,
     prefetch_depth: int = 1,
+    q_read_at: int = 2,
 ):
     """Same contract as sparse_mla_one_query_fwd_flydsl; topk must be a multiple of 32."""
     _require_gfx942()
@@ -67,6 +68,7 @@ def sparse_mla_pp_fwd_flydsl(
         slp=bool(slp),
         coalesce=bool(coalesce),
         prefetch_depth=int(prefetch_depth),
+        q_read_at=int(q_read_at),
     )
     n_tiles = -(-n_tok // TOKENS_PER_WG)
     idx = flat.to(dtype=torch.int32).contiguous()

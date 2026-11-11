@@ -106,6 +106,23 @@ def _bp_mfma_schedule(pv_blocks, qk_pairs, halves):
     return acts
 
 
+def _with_q_reads(acts, q_reg, q_lds, first):
+    """Insert ("q", j) (read parked Q pair q_reg + j from LDS) after MFMA first + j of
+    acts (1-based), one per MFMA, and in any case before the first QK of its pair."""
+    out, n_mm, j = [], 0, 0
+    for it in acts:
+        while j < q_lds and it[0] == "qk" and it[1] >= q_reg + j:
+            out.append(("q", j))
+            j += 1
+        out.append(it)
+        if it[0] in ("pv", "qk"):
+            n_mm += 1
+            if j < q_lds and n_mm >= first + j:
+                out.append(("q", j))
+                j += 1
+    return out + [("q", k) for k in range(j, q_lds)]
+
+
 @lru_cache(maxsize=8)
 def compile_sparse_mla_pp(
     has_sink=False,
@@ -118,6 +135,7 @@ def compile_sparse_mla_pp(
     coalesce=True,
     interleave_bp=True,
     prefetch_depth=1,
+    q_read_at=2,
 ):
     """Launcher of the ping-pong kernel; grid = ceil(T / TOKENS_PER_WG) workgroups.
 
@@ -153,6 +171,10 @@ def compile_sparse_mla_pp(
     # instead of ~16, and tag-RAM conflicts stall the L1 (TA busy 95%).
     COALESCE = bool(coalesce)
     INTER_BP = COALESCE and MFMA_T and bool(interleave_bp)
+    # interleave_bp: the parked-Q reads go one per MFMA, from MFMA Q_READ_AT of the M stream
+    # on (-1: all before it). Up front, M slot 0's 4 x 6 reads (right after the barrier)
+    # beat the other group's single partial-S read at the start of V to the LDS: ~250 cy.
+    Q_READ_AT = int(q_read_at) if INTER_BP else -1
     # Tiles between a gather and its M phase: 1 (default) = gather(t + 1) in V(t) into the
     # buffer M(t) just drained; 2 = gather(t + 2) in V(t), one register buffer per slot
     # (+32 VGPR). The L1's outstanding misses are full at either depth (the extra requests
@@ -178,6 +200,11 @@ def compile_sparse_mla_pp(
         + ("_slp" if SLP else "")
         + ("" if COALESCE else "_nocoal")
         + ("" if INTER_BP or not (COALESCE and MFMA_T) else "_nointer")
+        + (
+            ""
+            if not INTER_BP or Q_READ_AT == 2
+            else ("_qfront" if Q_READ_AT < 0 else f"_qra{Q_READ_AT}")
+        )
         + (f"_pd{PD}" if PD != 1 else "")
     )
     BIG = 1 << 24
@@ -432,11 +459,12 @@ def compile_sparse_mla_pp(
             return ops
 
         def _m_phase_bp(acc, vt, p_b, frags):
-            # interleave_bp: Q reads, then bpermute / MFMA alternating, then transposes
-            q_all = q_frags + [
-                _halves(q_park[warp, j, lane, None].load(), halves)
-                for j in range_constexpr(Q_LDS)
-            ]
+            # interleave_bp: bpermute / MFMA alternating (the parked-Q reads spread through
+            # it from MFMA Q_READ_AT on, or all up front), then transposes
+            q_all = q_frags + [None] * Q_LDS
+            if const_expr(Q_READ_AT < 0):
+                for j in range_constexpr(Q_LDS):
+                    q_all[Q_REG + j] = _halves(q_park[warp, j, lane, None].load(), halves)
             fx.rocdl.sched_barrier(0)
             if const_expr(SETPRIO):
                 fx.rocdl.s_setprio(1)
@@ -448,9 +476,14 @@ def compile_sparse_mla_pp(
             sched = _bp_mfma_schedule(
                 [(g, h) for g in range(PV_GROUPS) for h in range(H4)], QK_PAIRS, HALVES
             )
+            if const_expr(Q_READ_AT >= 0):
+                sched = _with_q_reads(sched, Q_REG, Q_LDS, Q_READ_AT)
             for n in range_constexpr(len(sched)):
                 act = sched[n]
-                if const_expr(act[0] == "bp"):
+                if const_expr(act[0] == "q"):
+                    j = act[1]
+                    q_all[Q_REG + j] = _halves(q_park[warp, j, lane, None].load(), halves)
+                elif const_expr(act[0] == "bp"):
                     pr, i = act[1] // 4, act[1] % 4
                     moved[pr][i] = fx.Int32(
                         fx.rocdl.ds_bpermute(T.i32, perm_addr, fx.Int32(dw[pr][i]))
