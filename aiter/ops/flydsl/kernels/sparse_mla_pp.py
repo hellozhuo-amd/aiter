@@ -68,6 +68,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 
 NWAVE = 8
 TOKENS_PER_WG = 4
+N_XCD = 8
 BLOCK_THREADS = NWAVE * WAVE
 BLOCK_K = 16
 HALF = HEAD_DIM // 2
@@ -136,6 +137,7 @@ def compile_sparse_mla_pp(
     interleave_bp=True,
     prefetch_depth=1,
     q_read_at=2,
+    xcd_remap=True,
 ):
     """Launcher of the ping-pong kernel; grid = ceil(T / TOKENS_PER_WG) workgroups.
 
@@ -180,6 +182,8 @@ def compile_sparse_mla_pp(
     # (+32 VGPR). The L1's outstanding misses are full at either depth (the extra requests
     # only queue), yet depth 1 is 0.98x on paged T=16384. Index loads run PD + 2 tiles ahead.
     PD = int(prefetch_depth)
+    # tokens -> XCD-contiguous: concurrent WGs on one XCD (one L2) take adjacent tokens
+    XCD_REMAP = bool(xcd_remap)
     if PD not in (1, 2):
         raise ValueError(f"prefetch_depth must be 1 or 2, got {PD}")
     IDX_AHEAD = PD + 2
@@ -206,6 +210,7 @@ def compile_sparse_mla_pp(
             else ("_qfront" if Q_READ_AT < 0 else f"_qra{Q_READ_AT}")
         )
         + (f"_pd{PD}" if PD != 1 else "")
+        + ("" if XCD_REMAP else "_noxcd")
     )
     BIG = 1 << 24
     CHUNKS = HEAD_DIM // VEC
@@ -275,6 +280,21 @@ def compile_sparse_mla_pp(
         else:
             ld_row, ld_chunk = lane_row, lane_g
         block = fx.Int32(gpu.block_id("x"))
+        if const_expr(XCD_REMAP):
+            # workgroups go round-robin over the XCDs (XCD = block % N_XCD): give XCD x the
+            # contiguous tiles [x q + min(x, r), +q + (x < r)), q, r = divmod(n_tiles, N_XCD)
+            n_tiles = fx.get_(
+                fx.idx2crd(
+                    fx.Int32(n_tok) + fx.Int32(TOKENS_PER_WG - 1),
+                    _colmajor(TOKENS_PER_WG, BIG),
+                ),
+                1,
+            ).unpack()
+            nc = fx.idx2crd(n_tiles, _colmajor(N_XCD, BIG))
+            xcd_r, xcd_q = fx.get_(nc, 0).unpack(), fx.get_(nc, 1).unpack()
+            bc = fx.idx2crd(block, _colmajor(N_XCD, BIG))
+            xcd, xcd_i = fx.get_(bc, 0).unpack(), fx.get_(bc, 1).unpack()
+            block = xcd * xcd_q + (xcd < xcd_r).select(xcd, xcd_r) + xcd_i
         t_idx = fx.get_scalar(fx.crd2idx((slot, block), _colmajor(TOKENS_PER_WG, BIG)))
         n_tok_i = fx.Int32(n_tok)
         live = t_idx < n_tok_i
