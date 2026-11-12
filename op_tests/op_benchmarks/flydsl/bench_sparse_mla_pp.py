@@ -3,11 +3,14 @@
 
 """Latency of the gfx942 FlyDSL sparse MLA prefill kernels on a production-like KV pool.
 
-Kernels (out[t] = softmax(scale * q[t] . kv[idx[t]]) @ kv[idx[t]], bf16, H=16, D=512):
-  fly_one_q  one-query kernel, 2 waves / token   (sparse_mla_one_query_fwd_flydsl)
+Kernels (out[t] = softmax(scale * q[t] . kv[idx[t]]) @ kv[idx[t]], bf16, H=16, D=512),
+in row order; the last column is the speedup over fly_yash (its median / the row's):
+  fly_yash   1 token / wave, full D               (flydsl_sparse_mla_fwd, ordered_indices=True:
+             the bench lists ascend through the pool)
   fly_pp     8-wave ping-pong, 4 tokens / WG     (sparse_mla_pp_fwd_flydsl)
-  fly_bq2/4  Q-block kernels; only when G tokens share one list (G % BQ == 0)
   triton     the shipping pa_decode_sparse path (--triton)
+  fly_one_q  one-query kernel, 2 waves / token   (only with --kernels ... fly_one_q)
+  fly_bq2/4  Q-block kernels; only when G tokens share one list (G % BQ == 0)
 
 Index pattern, default ``--pattern paged`` (GLM-5.3-Flash serving log, SILOTIGER-1215): the
 KV pool is every block of the server's cache, 3640 blocks x 1152 rows = 4,193,280 rows
@@ -86,9 +89,10 @@ def parse_args(argv=None):
         "--check-tokens", type=int, default=128, help="0 = skip the oracle check"
     )
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--kernels", nargs="+", choices=["triton", "fly_one_q", "fly_pp", "fly_bq2", "fly_bq4"],
-                   help="run only these rows (default: every applicable kernel); e.g. --kernels fly_pp "
-                        "for a trace capture that runs nothing else")  # fmt: skip
+    p.add_argument("--kernels", nargs="+",
+                   choices=["fly_yash", "fly_pp", "triton", "fly_one_q", "fly_bq2", "fly_bq4"],
+                   help="run only these rows (default: every applicable kernel but fly_one_q); "
+                        "e.g. --kernels fly_pp for a trace capture that runs nothing else")  # fmt: skip
     p.add_argument("--meta", action=argparse.BooleanOptionalAction, default=True,
                    help="print the compiled resources first")  # fmt: skip
     p.add_argument(
@@ -246,6 +250,16 @@ def cand_pp(q, kv, idx, indptr, sink, topk, scale):
     )
 
 
+def cand_yash(q, kv, idx, indptr, sink, topk, scale):
+    from aiter.ops.flydsl.sparse_mla import flydsl_sparse_mla_fwd
+
+    out = q.new_empty(q.shape)
+    rows = idx.view(q.shape[0], topk)  # dense [T, topk]; idx is int32 and contiguous
+    return lambda: flydsl_sparse_mla_fwd(
+        q, kv, rows, out, attn_sink=sink, softmax_scale=scale, ordered_indices=True
+    )
+
+
 def cand_qblock(block_q):
     def make(q, kv, idx, indptr, sink, topk, scale):
         from aiter.ops.flydsl.sparse_mla_qblock_kernels import (
@@ -281,6 +295,7 @@ def cand_triton(q, kv, idx, indptr, sink, topk, scale):
 
 
 CANDIDATES = {
+    "fly_yash": cand_yash,
     "fly_one_q": cand_one_q,
     "fly_pp": cand_pp,
     "fly_bq2": cand_qblock(2),
@@ -437,7 +452,7 @@ def run_bench(args):
         print("pattern=uniform: every list drawn from the whole pool")
     print()
     hdr = (f"{'T':>6} {'G':>2} {'pool GiB':>8} {'lists':>6} {'kernel':<10} {'median us':>10} {'min us':>9} "
-           f"{'TFLOP/s':>8} {'KV MB':>9} {'TB/s':>6} {'max|err|':>9} {'acc':>4}")  # fmt: skip
+           f"{'TFLOP/s':>8} {'KV MB':>9} {'TB/s':>6} {'max|err|':>9} {'acc':>4} {'speedup':>8}")  # fmt: skip
     print(hdr)
     print("-" * len(hdr))
 
@@ -481,8 +496,9 @@ def run_bench(args):
             indptr = torch.arange(
                 0, (n_tok + 1) * args.topk, args.topk, dtype=torch.int32
             )
-            runs = [(1, "triton", cand_triton)] if args.triton else []
-            runs += [(1, "fly_one_q", cand_one_q), (1, "fly_pp", cand_pp)]
+            runs = [(1, "fly_yash", cand_yash), (1, "fly_pp", cand_pp)]
+            runs += [(1, "triton", cand_triton)] if args.triton else []
+            runs += [(1, "fly_one_q", cand_one_q)]
             runs += [
                 (bq, f"fly_bq{bq}", CANDIDATES[f"fly_bq{bq}"])
                 for bq in (2, 4)
@@ -490,12 +506,14 @@ def run_bench(args):
             ]
             if args.kernels:
                 runs = [r for r in runs if r[1] in args.kernels]
+            else:
+                runs = [r for r in runs if r[1] != "fly_one_q"]
+            rows = []  # printed once the block is done: the speedup needs fly_yash's median
             for bq, name, make in runs:
                 fn = make(q, kv, idx, indptr, sink, args.topk, scale)
                 if fn is None:
-                    print(
-                        f"{n_tok:>6} {g:>2} {pool_gib:>8.2f} {n_lists:>6} {name:<10}   (not applicable)"
-                    )
+                    rows.append((name, None,
+                        f"{n_tok:>6} {g:>2} {pool_gib:>8.2f} {n_lists:>6} {name:<10}   (not applicable)"))  # fmt: skip
                     continue
                 if args.check_tokens:
                     err, ok = check(
@@ -509,11 +527,17 @@ def run_bench(args):
                 kv_b = (
                     -(-n_tok // bq) * args.topk * D * 2
                 )  # rows streamed: one list per BQ tile
-                print(
+                rows.append((name, med, (
                     f"{n_tok:>6} {g:>2} {pool_gib:>8.2f} {n_lists:>6} {name:<10} {med:>10.1f} {mn:>9.1f} "
                     f"{flop / med / 1e6:>8.1f} {kv_b / 1e6:>9.1f} "
                     f"{(kv_b + io_b) / med / 1e6:>6.2f} {err:>9.2e} {acc:>4}"
-                )
+                )))  # fmt: skip
+            ref = next((m for nm, m, _ in rows if nm == "fly_yash" and m), None)
+            for _nm, med, line in rows:
+                if med is None:
+                    print(line)
+                else:
+                    print(line + (f" {ref / med:>7.3f}x" if ref else f" {'-':>8}"))
             print()
             del idx, indptr
             torch.cuda.empty_cache()
