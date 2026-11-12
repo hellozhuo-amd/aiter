@@ -138,6 +138,7 @@ def compile_sparse_mla_pp(
     prefetch_depth=1,
     q_read_at=2,
     xcd_remap=True,
+    gather_in_m=4,
 ):
     """Launcher of the ping-pong kernel; grid = ceil(T / TOKENS_PER_WG) workgroups.
 
@@ -184,6 +185,10 @@ def compile_sparse_mla_pp(
     PD = int(prefetch_depth)
     # tokens -> XCD-contiguous: concurrent WGs on one XCD (one L2) take adjacent tokens
     XCD_REMAP = bool(xcd_remap)
+    # gather_in_m: pairs 0 .. GM-1 of the next tile's gather are issued in M, each right after
+    # the ds_bpermute that drains its register (one load per few MFMAs, from both groups);
+    # the rest stay spread through V's softmax
+    GM = int(gather_in_m) if INTER_BP else 0
     if PD not in (1, 2):
         raise ValueError(f"prefetch_depth must be 1 or 2, got {PD}")
     IDX_AHEAD = PD + 2
@@ -191,6 +196,8 @@ def compile_sparse_mla_pp(
     LAST_PREFETCH = tuple(s + PD < 2 for s in range(2))
     if G_SPLIT not in (1, 2, 4):
         raise ValueError(f"gather_split must be 1, 2 or 4, got {G_SPLIT}")
+    if not 0 <= GM <= 8:
+        raise ValueError(f"gather_in_m must be in [0, 8], got {GM}")
     # only non-default values are named, so the default build is plain "sparse_mla_pp"
     # (the WaveScope profile's kernelRegex ^sparse_mla_pp$)
     module_name = (
@@ -211,6 +218,7 @@ def compile_sparse_mla_pp(
         )
         + (f"_pd{PD}" if PD != 1 else "")
         + ("" if XCD_REMAP else "_noxcd")
+        + (f"_gm{GM}" if INTER_BP and GM != 4 else "")
     )
     BIG = 1 << 24
     CHUNKS = HEAD_DIM // VEC
@@ -478,7 +486,7 @@ def compile_sparse_mla_pp(
                 fx.rocdl.sched_barrier(0)
             return ops
 
-        def _m_phase_bp(acc, vt, p_b, frags):
+        def _m_phase_bp(acc, vt, p_b, frags, idx_next, prefetch):
             # interleave_bp: bpermute / MFMA alternating (the parked-Q reads spread through
             # it from MFMA Q_READ_AT on, or all up front), then transposes
             q_all = q_frags + [None] * Q_LDS
@@ -493,6 +501,7 @@ def compile_sparse_mla_pp(
             acc = list(acc)
             s_accs = [_zero4() for _ in range_constexpr(HALVES)]
             kops = [None] * QK_PAIRS
+            m_new = {}
             sched = _bp_mfma_schedule(
                 [(g, h) for g in range(PV_GROUPS) for h in range(H4)], QK_PAIRS, HALVES
             )
@@ -508,6 +517,9 @@ def compile_sparse_mla_pp(
                     moved[pr][i] = fx.Int32(
                         fx.rocdl.ds_bpermute(T.i32, perm_addr, fx.Int32(dw[pr][i]))
                     )
+                    if const_expr(prefetch and i == 3 and pr < GM):
+                        # the pair's register is drained (read at issue): refill it now
+                        m_new[pr] = kv_g[idx_next, _chunk(pr), None].load()
                 elif const_expr(act[0] == "pv"):
                     t = _py(fx.crd2idx((act[2], act[1]), acc_l))
                     acc[t] = _mfma_ssa(mma, vt[t], p_b, acc[t])
@@ -538,11 +550,11 @@ def compile_sparse_mla_pp(
             part_peer[lane, None].store(fx.Vector(s_acc).bitcast(fx.BFloat16))
             fx.rocdl.s_waitcnt(lgkmcnt=0)
             _phase_barrier()
-            return acc, s_acc, vt
+            return acc, s_acc, vt, m_new
 
-        def _m_phase(acc, vt, p_b, frags):
+        def _m_phase(acc, vt, p_b, frags, idx_next, prefetch):
             if const_expr(INTER_BP):
-                return _m_phase_bp(acc, vt, p_b, frags)
+                return _m_phase_bp(acc, vt, p_b, frags, idx_next, prefetch)
             if const_expr(COALESCE):
                 # issued before the PV burst, which covers their latency
                 frags = _to_mfma(frags)
@@ -566,7 +578,7 @@ def compile_sparse_mla_pp(
             part_peer[lane, None].store(fx.Vector(s_acc).bitcast(fx.BFloat16))
             fx.rocdl.s_waitcnt(lgkmcnt=0)
             _phase_barrier()
-            return acc, s_acc, vt
+            return acc, s_acc, vt, {}
 
         def _at(hooks, point):
             # a gather chunk pinned at this point of the softmax (G_SPLIT > 1)
@@ -604,7 +616,7 @@ def compile_sparse_mla_pp(
             p_b = fx.Vector.from_elements([_to_bf16(p) for p in p_t], fx.BFloat16)
             return m_n, l_i, acc, p_b
 
-        def _v_phase(t, s_acc, m_i, l_i, acc, vt, frags, idx_s, prefetch):
+        def _v_phase(t, s_acc, m_i, l_i, acc, vt, frags, idx_s, prefetch, m_new):
             peer = fx.Vector(part_own[lane, None].load()).bitcast(fx.Float32)
             if const_expr(not MFMA_T):
                 _store_tile(frags)
@@ -612,20 +624,24 @@ def compile_sparse_mla_pp(
             # loop's waitcnt state and drain the next tile's gather one phase early.
             new_frags = frags
             hooks = {}
+            # pairs GM .. 7 of the next tile (M issued the rest): spread evenly over
+            # G_SPLIT softmax points; the index load (tile t + IDX_AHEAD) stays last so the
+            # M-phase vmcnt counts keep their meaning
+            n_rem = QK_PAIRS - GM
+            got = dict(m_new)
             if const_expr(prefetch and G_SPLIT == 1):
-                new_frags = _gather(idx_s)
-                idx_s = _load_idx(t + fx.Int32(IDX_AHEAD))
+                for pr in range_constexpr(GM, QK_PAIRS):
+                    got[pr] = kv_g[idx_s, _chunk(pr), None].load()
+                got["idx"] = _load_idx(t + fx.Int32(IDX_AHEAD))
             elif const_expr(prefetch):
-                # chunk c of the 8 loads at softmax point POINTS[c]; the index load
-                # (tile t + IDX_AHEAD) stays last so the M-phase vmcnt counts keep their meaning
-                per = QK_PAIRS // G_SPLIT
                 points = (0, 3) if G_SPLIT == 2 else (0, 1, 2, 3)
-                got = {}
                 idx_cur = idx_s
 
                 def _chunk_loads(c):
                     def go():
-                        for pr in range_constexpr(c * per, (c + 1) * per):
+                        lo = GM + c * n_rem // G_SPLIT
+                        hi = GM + (c + 1) * n_rem // G_SPLIT
+                        for pr in range_constexpr(lo, hi):
                             got[pr] = kv_g[idx_cur, _chunk(pr), None].load()
                         if const_expr(c == G_SPLIT - 1):
                             got["idx"] = _load_idx(t + fx.Int32(IDX_AHEAD))
@@ -638,7 +654,7 @@ def compile_sparse_mla_pp(
                 [_elem(s_acc, i) + peer[i] for i in range_constexpr(4)], fx.Float32
             )
             m_i, l_i, acc, p_b = _softmax(s_acc, m_i, l_i, acc, hooks)
-            if const_expr(prefetch and G_SPLIT > 1):
+            if const_expr(prefetch):
                 new_frags = [got[pr] for pr in range_constexpr(QK_PAIRS)]
                 idx_s = got["idx"]
             if const_expr(not MFMA_T):
@@ -705,9 +721,10 @@ def compile_sparse_mla_pp(
             m_i, l_i, p_b, idxs, acc, vt, bufs = _unflat(state)
             for s in range_constexpr(2):
                 b, j = s % NBUF, (s + PD) % 2
-                acc, s_acc, vt = _m_phase(acc, vt, p_b, bufs[b])
+                acc, s_acc, vt, m_new = _m_phase(acc, vt, p_b, bufs[b], idxs[j], prefetch[s])
                 m_i, l_i, acc, p_b, vt, bufs[b], idxs[j] = _v_phase(
-                    t0 + fx.Int32(s), s_acc, m_i, l_i, acc, vt, bufs[b], idxs[j], prefetch[s]
+                    t0 + fx.Int32(s), s_acc, m_i, l_i, acc, vt, bufs[b], idxs[j], prefetch[s],
+                    m_new,
                 )
             return [m_i, l_i, p_b] + idxs + acc + vt + [v for bb in bufs for v in bb]
 
