@@ -76,6 +76,7 @@ from aiter.ops.flydsl.hstu_attention import flydsl_hstu_attention_fwd, fwd_pp_ti
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd_pp import (
     build_hstu_attention_fwd_pp,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 REPO = Path(__file__).resolve().parents[3]
 CK_BIN = Path(
@@ -202,8 +203,10 @@ def bench_cell(mask, max_attn_len, regime, b, h, target_size, providers, reps, p
             max_attn_len=max_attn_len, contextual_seq_len=0, has_targets=True,
             alpha=ALPHA, dtype_str="bf16", **tiles,
         )  # fmt: skip
-        launch["pingpong"] = lambda: pp(
-            SEQ_LEN, b, q, k, v, offsets, num_targets, out, stream
+        # Through the cached CompiledFunction, as production dispatches it: FlyDSL
+        # >= 0.5 re-traces the whole kernel on every direct launcher call.
+        launch["pingpong"] = lambda: _run_compiled(
+            pp, SEQ_LEN, b, q, k, v, offsets, num_targets, out, stream
         )  # fmt: skip
 
     # Each pass is (median, min) over its launches. CK's pass is one mean.
