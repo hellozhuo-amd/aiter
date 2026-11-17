@@ -56,10 +56,11 @@ from functools import cache, lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import fly as fly_dialect
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels.kernels_common import LOG2E, atomic_add_i32
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E, atomic_add_i32, pin_i32
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -78,11 +79,17 @@ RESCALE_TAU = 8.0
 TOKENS_PER_WORKGROUP = 4
 BLOCK_K = 16
 INDEX_FORMATS = ("dense", "csr", "dense_lengths")
-# Identity MFMAs issued ahead of their V^T pack; 2 adds a loop-top vmcnt(0).
-IDENTITY_MFMA_LEAD = 1
+# Identity MFMAs issued ahead of their V^T pack; the pack (two v_perm) runs one
+# PV step ahead of the MFMA that reads it.
+IDENTITY_MFMA_LEAD = 3
+# Unsplit launches issue the next tile's gathers inside softmax, in this many
+# chunks, instead of between the QK MFMAs: VALU work then hides their issue.
+SOFTMAX_GATHER_CHUNKS = 4
 
 
 def _mfma_ssa(mma, a, b, acc):
+    # SSA form: register vectors in and out, one MFMA per call, so the schedule
+    # can place each MFMA between lane transfers and gathers.
     out = fly_dialect.mma_atom_call_ssa(
         [fx.Vector.make_type(4, fx.Float32)],
         mma,
@@ -105,6 +112,14 @@ def _zero4():
 
 def _exp2(x):
     return fx.Float32(fx.rocdl.exp2(fx.Float32.ir_type, x.ir_value()))
+
+
+def _merge_alpha(m, mn):
+    """Rescale for running sums whose max moves from m to mn (natural log).
+
+    Equal maxima keep the sums: a +inf sink would otherwise give inf - inf.
+    """
+    return (m == mn).select(fx.Float32(1.0), _exp2((m - mn) * LOG2E))
 
 
 def _to_bf16(v):
@@ -165,6 +180,20 @@ def _halves(v8, halves):
     ]
 
 
+def _bpermute_acc(addr, src):
+    # ds_bpermute with AGPR data and result. fx.rocdl.ds_bpermute cannot pin
+    # either operand to AGPRs; the AGPR route keeps gathered dwords there, and
+    # the VGPR form first copies each one out with v_accvgpr_read (64 a tile).
+    # The asm is opaque to the waitcnt pass, so callers wait on lgkmcnt before
+    # reading the result.
+    ops = [x.ir_value() for x in (addr, src)]
+    return fx.Int32(
+        _llvm.inline_asm(
+            T.i32, ops, "ds_bpermute_b32 $0, $1, $2", "=a,v,a", has_side_effects=True
+        )
+    )
+
+
 def _bpermute_mfma_schedule(pv_blocks, qk_pairs, halves):
     """Interleave dword lane transfers with PV/QK; satisfy each QK dependency."""
     acts, bi, nbp = [], 0, 4 * qk_pairs
@@ -187,7 +216,12 @@ def _bpermute_mfma_schedule(pv_blocks, qk_pairs, halves):
 
 @lru_cache(maxsize=64)
 def compile_sparse_mla_fwd(
-    has_sink=False, index_format="dense", split_k=1, register_vt=False
+    has_sink=False,
+    index_format="dense",
+    split_k=1,
+    register_vt=False,
+    imm_gather=False,
+    agpr_bpermute=False,
 ):
     """Compile one specialization of the sparse MLA forward kernel.
 
@@ -198,6 +232,11 @@ def compile_sparse_mla_fwd(
     FP32 partials and (max, sum) stats; otherwise four tokens share a
     workgroup and the kernel writes bf16 output. register_vt selects the
     register V^T route for unsplit launches; split launches ignore it.
+    imm_gather (unsplit only) addresses each gathered row from one VGPR base
+    with immediate chunk offsets, which drops about 47 VALU per tile.
+    agpr_bpermute (with imm_gather) also keeps the gathered dwords and their
+    lane transfers in AGPRs. Results are identical; see
+    AGPR_BPERMUTE_MAX_WIDTH in the host wrapper for when it is faster.
     """
     if index_format not in INDEX_FORMATS:
         raise ValueError(f"index_format must be one of {INDEX_FORMATS}")
@@ -209,10 +248,16 @@ def compile_sparse_mla_fwd(
     NUM_WAVES = 1 if SPLIT else TOKENS_PER_WORKGROUP
     BLOCK_THREADS = NUM_WAVES * WAVE
     HAS_SINK = bool(has_sink) and not SPLIT
+    IMM_GATHER = bool(imm_gather) and not SPLIT
+    AGPR_BP = IMM_GATHER and bool(agpr_bpermute)
     vt_route = "register_vt" if REGISTER_VT else "lds_vt"
+    # Gather pairs issued in the QK MFMA phase; the rest go out in softmax.
+    GM = 8 if SPLIT else 0
+    GS = SOFTMAX_GATHER_CHUNKS
+    assert GS in (1, 2, 4)
     kernel_name = (
         f"sparse_mla_fwd_{index_format}_{vt_route}"
-        f"_sink{int(HAS_SINK)}_split{split_k}"
+        f"_sink{int(HAS_SINK)}_split{split_k}{'_imm' if IMM_GATHER else ''}{'_agbp' if AGPR_BP else ''}"
     )
     UNBOUNDED = 1 << 24
     CHUNKS_PER_ROW = HEAD_DIM // VEC
@@ -260,7 +305,7 @@ def compile_sparse_mla_fwd(
         acc_l = _colmajor(H4, PV_GROUPS)
         N_ACC = _static_int(fx.size(acc_l))
 
-        tid = fx.Int32(gpu.thread_id("x"))
+        tid = fx.thread_idx.x
         tc = fx.idx2crd(tid, _colmajor(WAVE, NUM_WAVES))
         lane = fx.get_(tc, 0).unpack()
         warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.get_(tc, 1).unpack()))
@@ -278,7 +323,7 @@ def compile_sparse_mla_fwd(
         # MFMA lane r + 16g consumes gather lane 4r + g (byte address).
         perm_addr = (lane_row * fx.Int32(4) + lane_g) * fx.Int32(4)
         head_xor = [_static_int(fx.crd2idx((0, b), lanes)) for b in (1, 2)]
-        block = fx.Int32(gpu.block_id("x"))
+        block = fx.block_idx.x
         t_idx = fx.get_scalar(
             fx.crd2idx((slot, block), _colmajor(NUM_WAVES, UNBOUNDED))
         )
@@ -296,7 +341,7 @@ def compile_sparse_mla_fwd(
         else:
             out_l = _rowmajor(UNBOUNDED, NUM_HEADS, PV_GROUPS, 4, 4, H4)
         out_g = fx.make_view(fx.rocdl.make_buffer_ptr(out_ptr), out_l)
-        split = fx.Int32(gpu.block_id("y"))
+        split = fx.block_idx.y
         width = fx.Int32(index_width)
         start = q_row * width
         length = width
@@ -319,11 +364,36 @@ def compile_sparse_mla_fwd(
         count = per_split + (split < extra).select(fx.Int32(1), fx.Int32(0))
         paired_count = ((count + 1) // 2) * 2
         n_kt = (paired_count > 0).select(paired_count, fx.Int32(2))
-        kv_g = fx.make_view(
-            fx.rocdl.make_buffer_ptr(kv_ptr), _rowmajor(UNBOUNDED, CHUNKS_PER_ROW, VEC)
-        )
+        kv_buf = fx.rocdl.make_buffer_ptr(kv_ptr)
+        kv_g = fx.make_view(kv_buf, _rowmajor(UNBOUNDED, CHUNKS_PER_ROW, VEC))
         # Adjacent groups of four lanes read one row's four 16-byte chunks.
         g_chunks = _rowmajor(QK_PAIRS, 4)
+        if const_expr(IMM_GATHER):
+            # Byte offsets fit uint32: the pool is below 2^31 bf16 elements.
+            kv_rsrc = fx.rocdl.get_buffer_rsrc(kv_buf)
+            row_bytes = HEAD_DIM * 2
+            lane_bytes = ld_chunk * fx.Int32(VEC * 2)
+            frag_ty = fx.Vector.make_type(4, fx.Int32)
+
+        def _kv_base(idx_v):
+            # Opaque, so LLVM cannot fold a chunk offset back into this VGPR.
+            return pin_i32(idx_v * fx.Int32(row_bytes) + lane_bytes)
+
+        def _kv_load(base, pr):
+            # A kv_g copy-atom load computes each chunk's voffset with VALU
+            # (v_or + v_lshl) and leaves the immediate offset at 0. This raw
+            # load reuses one base per row and puts the chunk offset in the
+            # immediate field; the IMM route is 3-20% faster at K512/K1024 on
+            # sorted rows.
+            off = _static_int(fx.crd2idx((pr, 0), g_chunks)) * VEC * 2
+            raw = fx.rocdl.raw_ptr_buffer_load(
+                frag_ty,
+                kv_rsrc,
+                (base + fx.Int32(off)).ir_value(),
+                fx.Int32(0).ir_value(),
+                aux=0,
+            )
+            return fx.Vector(raw).bitcast(fx.BFloat16)
 
         # ---- LDS V^T route: one private region [16 rows][512 d] per wave, swizzled
         if const_expr(LDS_VT):
@@ -347,9 +417,9 @@ def compile_sparse_mla_fwd(
             )
 
         qk_scale = fx.Float32(scale) * fx.Float32(LOG2E)
-        neg_inf = fx.Float32(arith.constant(NEG_INF, type=T.f32))
-        zero_f = fx.Float32(arith.constant(0.0, type=T.f32))
-        one_f = fx.Float32(arith.constant(1.0, type=T.f32))
+        neg_inf = fx.Float32(NEG_INF)
+        zero_f = fx.Float32(0.0)
+        one_f = fx.Float32(1.0)
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
         if const_expr(REGISTER_VT):
             # B = I: lane (n, g) holds B[4g + j][n].
@@ -406,9 +476,14 @@ def compile_sparse_mla_fwd(
         def _gather(idx_v):
             raw_idx = idx_v
             idx_v = (idx_v >= 0).select(idx_v, fx.Int32(0))
-            frags = [
-                kv_g[idx_v, _chunk(pr), None].load() for pr in range_constexpr(QK_PAIRS)
-            ]
+            if const_expr(IMM_GATHER):
+                base = _kv_base(idx_v)
+                frags = [_kv_load(base, pr) for pr in range_constexpr(QK_PAIRS)]
+            else:
+                frags = [
+                    kv_g[idx_v, _chunk(pr), None].load()
+                    for pr in range_constexpr(QK_PAIRS)
+                ]
             frags.append(fx.Vector.from_elements([raw_idx], fx.Int32))
             return frags
 
@@ -447,14 +522,17 @@ def compile_sparse_mla_fwd(
             # d = 32 pr + 8 (n // 4) + 4 hh + n % 4, column k is token k (exact f32).
             return _mfma_ssa(mma, kop, identity, _zero4())
 
-        def _pv_packed(acc_t, d, p):
+        def _pack(d):
             # D is exact bf16 in f32: its high halves are already the bf16 A operand
             # (lane (n, g) holds tokens 4g..4g+3, matching the QK S^T order of p).
             w = fx.Vector(d).bitcast(fx.Int32)
             lo = fx.rocdl.perm_b32(fx.Int32(w[1]), fx.Int32(w[0]), high_halves)
             hi = fx.rocdl.perm_b32(fx.Int32(w[3]), fx.Int32(w[2]), high_halves)
             a = fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32)
-            return _mfma_ssa(mma, a.bitcast(fx.BFloat16), p, acc_t)
+            return a.bitcast(fx.BFloat16)
+
+        def _pv_packed(acc_t, d, p):
+            return _mfma_ssa(mma, _pack(d), p, acc_t)
 
         def _mask_vt(vt, valid_bits):
             # Invalid K rows may hold NaN and NaN * 0 survives the MFMAs: zero them.
@@ -545,6 +623,7 @@ def compile_sparse_mla_fwd(
                 # packed bf16 PV MFMAs that use them.
                 new_vt = [None] * N_ACC
                 transposed = {}
+                packed = {}
                 sched = _bpermute_mfma_schedule(
                     [(g, h) for g in range(PV_GROUPS) for h in range(H4)],
                     QK_PAIRS,
@@ -556,14 +635,21 @@ def compile_sparse_mla_fwd(
                     if a[0] == "pv"
                 ]
                 pv_n = 0
+                n_bp = 0
                 for n in range_constexpr(len(sched)):
                     act = sched[n]
                     if const_expr(act[0] == "bp"):
                         pr, i = act[1] // 4, act[1] % 4
-                        moved[pr][i] = fx.Int32(
-                            fx.rocdl.ds_bpermute(T.i32, perm_addr, fx.Int32(dw[pr][i]))
-                        )
-                        if const_expr(prefetch and i == 3):
+                        if const_expr(AGPR_BP):
+                            moved[pr][i] = _bpermute_acc(perm_addr, fx.Int32(dw[pr][i]))
+                            n_bp += 1
+                        else:
+                            moved[pr][i] = fx.Int32(
+                                fx.rocdl.ds_bpermute(
+                                    T.i32, perm_addr, fx.Int32(dw[pr][i])
+                                )
+                            )
+                        if const_expr(prefetch and i == 3 and pr < GM):
                             # Raw registers are free after their fourth transfer.
                             # Preserve the PV-first FIFO lookahead before QK use.
                             fx.rocdl.sched_barrier(0)
@@ -578,14 +664,25 @@ def compile_sparse_mla_fwd(
                                     min(IDENTITY_MFMA_LEAD, len(pv_ts))
                                 ):
                                     transposed[pv_ts[j]] = _identity_mfma(vt[pv_ts[j]])
+                                packed[t] = _pack(transposed.pop(t))
                             if const_expr(pv_n + IDENTITY_MFMA_LEAD < len(pv_ts)):
                                 u = pv_ts[pv_n + IDENTITY_MFMA_LEAD]
                                 transposed[u] = _identity_mfma(vt[u])
-                            acc[t] = _pv_packed(acc[t], transposed.pop(t), p_b)
+                            acc[t] = _mfma_ssa(mma, packed.pop(t), p_b, acc[t])
+                            if const_expr(pv_n + 1 < len(pv_ts)):
+                                # Pack the next tile now so its perms sit a full
+                                # step ahead of the PV MFMA that reads them.
+                                tn = pv_ts[pv_n + 1]
+                                packed[tn] = _pack(transposed.pop(tn))
                         pv_n += 1
                     else:
                         pr, h = act[1], act[2]
                         if const_expr(kops[pr] is None):
+                            if const_expr(AGPR_BP):
+                                # LDS returns in order: pair pr's four transfers
+                                # are done once at most this many remain.
+                                fx.rocdl.s_waitcnt(lgkmcnt=min(14, n_bp - 4 * pr - 4))
+                                fx.rocdl.sched_barrier(0)
                             kops[pr] = _halves(
                                 fx.Vector.from_elements(moved[pr], fx.Int32).bitcast(
                                     fx.BFloat16
@@ -626,7 +723,9 @@ def compile_sparse_mla_fwd(
                 fx.Int64(fx.rocdl.ballot(T.i64, fx.Int32(frags[-1][0]) >= 0))
             )
 
-        def _softmax(s_acc, m_i, l_i, acc, valid_bits):
+        def _softmax(s_acc, m_i, l_i, acc, valid_bits, hooks=(None,) * 4):
+            if const_expr(hooks[0] is not None):
+                hooks[0]()
             scores = []
             for i in range_constexpr(4):
                 valid = live & (
@@ -637,6 +736,8 @@ def compile_sparse_mla_fwd(
             for i in range_constexpr(1, 4):
                 m_w = (m_w > scores[i]).select(m_w, scores[i])
             # Lazy rescale: keep the stale max until some head grows past RESCALE_TAU.
+            if const_expr(hooks[1] is not None):
+                hooks[1]()
             moved = fx.Int64(
                 fx.rocdl.ballot(
                     fx.Int64.ir_type, (m_w - m_i) * qk_scale > fx.Float32(RESCALE_TAU)
@@ -647,33 +748,68 @@ def compile_sparse_mla_fwd(
             if moved != fx.Int64(0):
                 m_h = _head_max(m_w, head_xor)
                 m_n = (m_h > m_i).select(m_h, m_i)
-                alpha = (m_n == neg_inf).select(zero_f, _exp2((m_i - m_n) * qk_scale))
+                alpha = (m_n == neg_inf).select(
+                    zero_f, _exp2(fx.fma(m_i, qk_scale, -(m_n * qk_scale)))
+                )
                 acc = _rescale_all(acc, alpha)
+            if const_expr(hooks[2] is not None):
+                hooks[2]()
             empty = m_n == neg_inf
+            neg_m = -(m_n * qk_scale)
             p_t = []
             for i in range_constexpr(4):
-                p = empty.select(zero_f, _exp2((scores[i] - m_n) * qk_scale))
+                p = empty.select(zero_f, _exp2(scores[i] * qk_scale + neg_m))
                 p_t.append(live.select(p, zero_f))
             l_i = l_i * alpha + ((p_t[0] + p_t[1]) + (p_t[2] + p_t[3]))
             p_b = fx.Vector.from_elements([_to_bf16(p) for p in p_t], fx.BFloat16)
+            if const_expr(hooks[3] is not None):
+                hooks[3]()
             return m_n, l_i, acc, p_b
 
         def _softmax_phase(s_acc, m_i, l_i, acc, frags, idx_s, prefetch, new_frags, vt):
             """Softmax of this tile and its V^T for the next PV."""
             # Prefetch is static here: a runtime skip would merge a gather-free
             # path into loop waitcnt state and drain the next gather early.
+            hooks = [None] * 4
+            if const_expr(not SPLIT and prefetch and GM < QK_PAIRS):
+                # Pairs GM.. of the next gather go out here, one chunk per softmax hook.
+                new_frags = list(new_frags)
+                safe_idx = (idx_s >= 0).select(idx_s, fx.Int32(0))
+                if const_expr(IMM_GATHER):
+                    kv_base = _kv_base(safe_idx)
+                rest = list(range(GM, QK_PAIRS))
+                per = -(-len(rest) // GS)
+                for c in range_constexpr(GS):
+                    chunk = rest[c * per : (c + 1) * per]
+                    if const_expr(len(chunk) > 0):
+
+                        def _issue(chunk=chunk):
+                            for pr in chunk:
+                                if const_expr(IMM_GATHER):
+                                    new_frags[pr] = _kv_load(kv_base, pr)
+                                else:
+                                    new_frags[pr] = kv_g[
+                                        safe_idx, _chunk(pr), None
+                                    ].load()
+                            fx.rocdl.sched_barrier(0)
+
+                        hooks[c * (4 // GS)] = _issue
             if const_expr(LDS_VT):
                 _store_tile(frags)
                 if const_expr(SPLIT and prefetch):
                     new_frags = _gather(idx_s)
                     fx.rocdl.sched_barrier(0)
                 valid_bits = _ballot_valid(frags)
-                m_i, l_i, acc, p_b = _softmax(s_acc, m_i, l_i, acc, valid_bits)
+                m_i, l_i, acc, p_b = _softmax(
+                    s_acc, m_i, l_i, acc, valid_bits, tuple(hooks)
+                )
                 vt = _read_vt()
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
             else:
                 valid_bits = _ballot_valid(frags)
-                m_i, l_i, acc, p_b = _softmax(s_acc, m_i, l_i, acc, valid_bits)
+                m_i, l_i, acc, p_b = _softmax(
+                    s_acc, m_i, l_i, acc, valid_bits, tuple(hooks)
+                )
                 vt = _mask_vt(vt, valid_bits)
             return m_i, l_i, acc, p_b, vt, new_frags
 
@@ -881,9 +1017,9 @@ def compile_sparse_mla_combine(splits, has_sink):
         sink_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        t = fx.Int32(gpu.block_id("x"))
-        head = fx.Int32(gpu.block_id("y"))
-        tid = fx.Int32(gpu.thread_id("x"))
+        t = fx.block_idx.x
+        head = fx.block_idx.y
+        tid = fx.thread_idx.x
         part = fx.make_view(
             fx.rocdl.make_buffer_ptr(part_ptr),
             _rowmajor(1 << 20, splits, 128, 16, 2, 2),
@@ -908,8 +1044,7 @@ def compile_sparse_mla_combine(splits, has_sink):
             ms = fx.Float32(stats[t, s, head, 0])
             ls = fx.Float32(stats[t, s, head, 1])
             mn = (ms > m).select(ms, m)
-            empty = mn == fx.Float32(float("-inf"))
-            alpha = empty.select(fx.Float32(0.0), _exp2((m - mn) * LOG2E))
+            alpha = _merge_alpha(m, mn)
             beta = (ls > 0).select(_exp2((ms - mn) * LOG2E), fx.Float32(0.0))
             v = fx.Vector(part[t, s, tid // 2, head, tid % 2, None].load())
             a0 = a0 * alpha + v[0] * beta
@@ -933,9 +1068,9 @@ def compile_sparse_mla_combine(splits, has_sink):
         sink_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        t = fx.Int32(gpu.block_id("x"))
-        db = fx.Int32(gpu.block_id("y"))
-        tid = fx.Int32(gpu.thread_id("x"))
+        t = fx.block_idx.x
+        db = fx.block_idx.y
+        tid = fx.thread_idx.x
         lane = tid % 64
         wave = tid // 64
         head = lane // 4
@@ -962,8 +1097,7 @@ def compile_sparse_mla_combine(splits, has_sink):
                 fx.Float32(stats[t, safe, head, 0]), fx.Float32(float("-inf"))
             )
             mn = (ms > m).select(ms, m)
-            empty = mn == fx.Float32(float("-inf"))
-            alpha = empty.select(fx.Float32(0.0), _exp2((m - mn) * LOG2E))
+            alpha = _merge_alpha(m, mn)
             beta = (ls > 0).select(_exp2((ms - mn) * LOG2E), fx.Float32(0.0))
             v = fx.Float32(part[t, safe, db, head, dim])
             acc = acc * alpha + v * beta
@@ -979,7 +1113,7 @@ def compile_sparse_mla_combine(splits, has_sink):
         shared[0, wave, lane] = m
         shared[1, wave, lane] = l
         shared[2, wave, lane] = acc
-        gpu.barrier()
+        fx.barrier()
         if wave == fx.Int32(0):
             m = fx.Float32(float("-inf"))
             l = fx.Float32(0.0)
@@ -994,8 +1128,7 @@ def compile_sparse_mla_combine(splits, has_sink):
                 ms = fx.Float32(shared[0, w, lane])
                 ls = fx.Float32(shared[1, w, lane])
                 mn = (ms > m).select(ms, m)
-                empty = mn == fx.Float32(float("-inf"))
-                alpha = empty.select(fx.Float32(0.0), _exp2((m - mn) * LOG2E))
+                alpha = _merge_alpha(m, mn)
                 beta = (ls > 0).select(_exp2((ms - mn) * LOG2E), fx.Float32(0.0))
                 acc = acc * alpha + fx.Float32(shared[2, w, lane]) * beta
                 l = l * alpha + ls * beta
@@ -1065,7 +1198,7 @@ def compile_sparse_mla_order_indices(
         within = fx.make_rmem_tensor(items, fx.Int32)
         for w in range_constexpr(words_per_thread):
             scratch[tid + w * threads] = fx.Int32(0)
-        gpu.barrier()
+        fx.barrier()
         src_vec = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(fx.slice(src, (row, None)), max_size=False),
             fx.make_layout(4, 1),
@@ -1115,7 +1248,7 @@ def compile_sparse_mla_order_indices(
             compact_regs[item] = compact
             if const_expr(logical):
                 regs[item] = (rank >= 0).select(compact, fx.Int32(-1))
-        gpu.barrier()
+        fx.barrier()
         for item in range_constexpr(items):
             compact = compact_regs[item]
             shift = ((compact // 16) % 4) * 8
@@ -1139,7 +1272,7 @@ def compile_sparse_mla_order_indices(
         prefix, total = Scan.exclusive_with_aggregate(
             count, fx.ReductionOp.ADD, storage=scan
         )
-        gpu.barrier()
+        fx.barrier()
         if total == 2048:
             # Prefix four byte-sized tile counts per word, then rank only
             # the selected inputs. Keep values in registers and reuse LDS
@@ -1147,13 +1280,13 @@ def compile_sparse_mla_order_indices(
             for w in range_constexpr(words_per_thread):
                 scratch[tid * words_per_thread + w] = prefix
                 prefix = prefix + counts[w]
-            gpu.barrier()
+            fx.barrier()
             for item in range_constexpr(items):
                 within[item] = scratch[compact_regs[item] // 64] + within[item]
-            gpu.barrier()
+            fx.barrier()
             for item in range_constexpr(items):
                 scratch[within[item]] = regs[item]
-            gpu.barrier()
+            fx.barrier()
             for v in range_constexpr(items // 4):
                 part = fx.slice(dst_vec, (None, tid + v * threads))
                 frag = fx.make_fragment_like(part)
@@ -1199,7 +1332,7 @@ def compile_sparse_mla_order_indices(
                         scratch[(tid + (item // 4) * block_threads) * 4 + item % 4] = (
                             regs[item]
                         )
-                    gpu.barrier()
+                    fx.barrier()
                 for item in range_constexpr(items):
                     pos = (tid + (item // 4) * block_threads) * 4 + item % 4
                     left = regs[item]
@@ -1217,7 +1350,7 @@ def compile_sparse_mla_order_indices(
                     swap = take_min.select(left > right, left < right)
                     tmp[item] = swap.select(right, left)
                 if const_expr(256 <= stride < block_threads * 4):
-                    gpu.barrier()
+                    fx.barrier()
                 for item in range_constexpr(items):
                     regs[item] = tmp[item]
             for item in range_constexpr(items):
