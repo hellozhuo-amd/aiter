@@ -14,7 +14,7 @@ order, so the output is bitwise identical to it. Host wrapper:
   registers are the QK A operands as loaded.
 * The PV operands (V^T) are the same registers transposed. Default
   (``mfma_transpose``): 16 identity MFMAs per tile, C = K_block @ I^T, exact for
-  bf16. 6 of the 8 Q fragment pairs are parked in LDS to make room for the V^T
+  bf16. 3 of the 8 Q fragment pairs are parked in LDS to make room for the V^T
   registers, which then stay live across the V phase. Alternative: write the tile
   into a private 8 KiB LDS region and read it back transposed (8 x 8 KiB = the
   whole 64 KiB).
@@ -37,10 +37,11 @@ from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels.kernels_common import LOG2E
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E, pin_i32
 from aiter.ops.flydsl.kernels.sparse_mla_qblock import (
     HEAD_DIM,
     NEG_INF,
@@ -107,6 +108,14 @@ def _bp_mfma_schedule(pv_blocks, qk_pairs, halves):
     return acts
 
 
+def _pin_here(v):
+    """`v` (Int32) out of an empty side-effecting asm: LLVM can neither sink its producer
+    past the asm nor move the asm across other side effects (barriers, sched_barrier)."""
+    return fx.Int32(
+        _llvm.inline_asm(T.i32, [fx.Int32(v).ir_value()], "", "=v,0", has_side_effects=True)
+    )
+
+
 def _with_q_reads(acts, q_reg, q_lds, first):
     """Insert ("q", j) (read parked Q pair q_reg + j from LDS) after MFMA first + j of
     acts (1-based), one per MFMA, and in any case before the first QK of its pair."""
@@ -130,7 +139,7 @@ def compile_sparse_mla_pp(
     skew=True,
     setprio=True,
     mfma_transpose=True,
-    q_lds=6,
+    q_lds=3,
     gather_split=4,
     slp=False,
     coalesce=True,
@@ -139,6 +148,12 @@ def compile_sparse_mla_pp(
     q_read_at=2,
     xcd_remap=True,
     gather_in_m=4,
+    imm_gather=True,
+    pin_vt=False,
+    live_mask=True,
+    p_fma=False,
+    pack_ahead=0,
+    pack_in_v=True,
 ):
     """Launcher of the ping-pong kernel; grid = ceil(T / TOKENS_PER_WG) workgroups.
 
@@ -151,7 +166,10 @@ def compile_sparse_mla_pp(
     ``mfma_transpose`` builds the PV operands with identity MFMAs in the M phase
     instead of an LDS tile write + transposed read in the V phase. Paged T=16384:
     0.96x the LDS path (8.03 vs 9.12 M cycles, at 1.29 vs 1.40 GHz). ``q_lds`` Q pairs
-    are parked in LDS; with ``mfma_transpose`` fewer than 6 spill VGPRs.
+    are parked in LDS. With ``pack_in_v`` V^T crosses V packed (32 VGPR, not 64 fp32), so 3
+    suffice (206 VGPR); paged T=16384, MI300X: q_lds 6 / 4 / 3 / 2 = 0.994 / 0.983 / 0.976 /
+    1.10x of the pre-pack_in_v default (2 still has no spills). The old default is
+    ``imm_gather=False, pack_in_v=False, q_lds=6``.
     """
     HAS_SINK = bool(has_sink)
     SKEW = bool(skew)
@@ -189,6 +207,28 @@ def compile_sparse_mla_pp(
     # the ds_bpermute that drains its register (one load per few MFMAs, from both groups);
     # the rest stay spread through V's softmax
     GM = int(gather_in_m) if INTER_BP else 0
+    # imm_gather (Yash's kernel): one pinned VGPR base per gathered row, the 64-B pair offset
+    # in the buffer_load immediate field; drops the per-load v_lshlrev/v_or/v_lshlrev
+    IMM_G = bool(imm_gather)
+    # pin_vt (MFMA_T): the V^T bf16 packs (2 v_perm per PV block) stay in M right after
+    # their transposes. Unpinned, LLVM sinks them into the next M, in front of each PV MFMA
+    # (VALU write -> MFMA read: an s_nop 1 per PV MFMA) and carries the fp32 transposes
+    # (64 VGPR) across V instead of the packed operands (32).
+    # pack_ahead = L > 0 (interleave_bp, Yash's schedule): V^T is carried as the fp32
+    # transposes and M packs PV block n + L right after PV MFMA n (pinned there), so no pack
+    # sits next to the MFMA that reads it. Overrides pin_vt.
+    PACK_AHEAD = int(pack_ahead) if INTER_BP else 0
+    # pack_in_v (MFMA_T): the V^T packs (32 v_perm per tile) run pinned in V, which has
+    # slack, instead of in M in front of each PV MFMA (with an s_nop 1 each). M is the
+    # critical phase: one PV MFMA per ~44 cy, issue-bound on its per-MFMA overhead.
+    PACK_V = bool(pack_in_v) and MFMA_T and not PACK_AHEAD
+    PIN_VT = bool(pin_vt) and MFMA_T and not PACK_AHEAD and not PACK_V
+    # live_mask: select dead tokens' scores / probabilities to -inf / 0 (8 v_cndmask per
+    # tile). Their output is never stored and q_row clamps their reads, so it is optional.
+    LIVE_MASK = bool(live_mask)
+    # p_fma: p = exp2(s * c - m * c) with m * c hoisted (one FMA per score) instead of
+    # exp2((s - m) * c) (sub + mul); also Yash's FP32-range-safe order
+    P_FMA = bool(p_fma)
     if PD not in (1, 2):
         raise ValueError(f"prefetch_depth must be 1 or 2, got {PD}")
     IDX_AHEAD = PD + 2
@@ -206,7 +246,7 @@ def compile_sparse_mla_pp(
         + ("" if SKEW else "_noskew")
         + ("" if SETPRIO else "_noprio")
         + ("" if MFMA_T else "_nomt")
-        + (f"_ql{Q_LDS}" if Q_LDS != 6 else "")
+        + (f"_ql{Q_LDS}" if Q_LDS != 3 else "")
         + (f"_gs{G_SPLIT}" if G_SPLIT != 4 else "")
         + ("_slp" if SLP else "")
         + ("" if COALESCE else "_nocoal")
@@ -219,6 +259,12 @@ def compile_sparse_mla_pp(
         + (f"_pd{PD}" if PD != 1 else "")
         + ("" if XCD_REMAP else "_noxcd")
         + (f"_gm{GM}" if INTER_BP and GM != 4 else "")
+        + ("" if IMM_G else "_noimm")
+        + ("_pinvt" if PIN_VT else "")
+        + (f"_pa{PACK_AHEAD}" if PACK_AHEAD else "")
+        + ("" if PACK_V or not MFMA_T or PACK_AHEAD else "_nopackv")
+        + ("" if LIVE_MASK else "_nolive")
+        + ("_pfma" if P_FMA else "")
     )
     BIG = 1 << 24
     CHUNKS = HEAD_DIM // VEC
@@ -336,6 +382,28 @@ def compile_sparse_mla_pp(
         )
         # lane (r, g), pair p: 16-B chunk (half, p, g) of row idx[r]
         g_chunks = _rowmajor(2, QK_PAIRS, 4)
+        if const_expr(IMM_G):
+            # byte offsets fit uint32: the pool is below 2^31 bf16 elements
+            kv_rsrc = fx.rocdl.get_buffer_rsrc(fx.rocdl.make_buffer_ptr(kv_ptr))
+            lane_bytes = fx.get_scalar(fx.crd2idx((half, 0, ld_chunk), g_chunks)) * fx.Int32(VEC * 2)
+            frag_ty = fx.Vector.make_type(4, fx.Int32)
+
+        def _row_loader(idx_v):
+            """pr -> the lane's 16 B of pair pr of row idx_v (one base per row with IMM_G)."""
+            if const_expr(IMM_G):
+                # opaque, so LLVM cannot fold a pair offset back into this VGPR
+                base = pin_i32(idx_v * fx.Int32(HEAD_DIM * 2) + lane_bytes)
+
+                def load(pr):
+                    off = _py(fx.crd2idx((0, pr, 0), g_chunks)) * VEC * 2
+                    raw = fx.rocdl.raw_ptr_buffer_load(
+                        frag_ty, kv_rsrc, (base + fx.Int32(off)).ir_value(),
+                        fx.Int32(0).ir_value(), aux=0,
+                    )  # fmt: skip
+                    return fx.Vector(raw).bitcast(fx.BFloat16)
+
+                return load
+            return lambda pr: kv_g[idx_v, _chunk(pr), None].load()
 
         # ---- LDS: 8 private regions [16 rows][256 d], swizzled
         @fx.struct
@@ -416,9 +484,8 @@ def compile_sparse_mla_pp(
             return out
 
         def _gather(idx_v):
-            return [
-                kv_g[idx_v, _chunk(pr), None].load() for pr in range_constexpr(QK_PAIRS)
-            ]
+            load = _row_loader(idx_v)
+            return [load(pr) for pr in range_constexpr(QK_PAIRS)]
 
         def _store_tile(frags):
             lane_chunks = _rowmajor(QK_PAIRS, 4)
@@ -443,12 +510,23 @@ def compile_sparse_mla_pp(
                 ]
             return ops
 
+        def _pack_vt(c):
+            # fp32 transpose -> PV A operand: the high bf16 of each fp32, pinned in place
+            hi = fx.Vector(c).bitcast(fx.BFloat16)
+            w = fx.Vector.from_elements(
+                [hi[2 * i + 1] for i in range_constexpr(4)], fx.BFloat16
+            ).bitcast(fx.Int32)
+            return fx.Vector.from_elements(
+                [_pin_here(w[j]) for j in range_constexpr(2)], fx.Int32
+            ).bitcast(fx.BFloat16)
+
         def _pv(acc, vt, p_b):
             acc = list(acc)
             for g in range_constexpr(PV_GROUPS):
                 for h in range_constexpr(H4):
                     t = _py(fx.crd2idx((h, g), acc_l))
-                    acc[t] = _mfma_ssa(mma, vt[t], p_b, acc[t])
+                    a = _pack_vt(vt[t]) if const_expr(PACK_AHEAD) else vt[t]
+                    acc[t] = _mfma_ssa(mma, a, p_b, acc[t])
             return acc
 
         def _qk(frags, q_all):
@@ -478,11 +556,20 @@ def compile_sparse_mla_pp(
                     for hf in range_constexpr(HALVES):
                         cs.append((pr, hf, _mfma_ssa(mma, k[hf], eye, _zero4())))
                 for pr, hf, c in cs:
+                    if const_expr(PACK_AHEAD or PACK_V):
+                        ops[_py(fx.crd2idx((hf, pr), blk_l))] = c  # packed later
+                        continue
                     # the high bf16 of each fp32 is the transposed value
                     hi = fx.Vector(c).bitcast(fx.BFloat16)
-                    ops[_py(fx.crd2idx((hf, pr), blk_l))] = fx.Vector.from_elements(
+                    op = fx.Vector.from_elements(
                         [hi[2 * i + 1] for i in range_constexpr(4)], fx.BFloat16
                     )
+                    if const_expr(PIN_VT):
+                        w = op.bitcast(fx.Int32)
+                        op = fx.Vector.from_elements(
+                            [_pin_here(w[j]) for j in range_constexpr(2)], fx.Int32
+                        ).bitcast(fx.BFloat16)
+                    ops[_py(fx.crd2idx((hf, pr), blk_l))] = op
                 fx.rocdl.sched_barrier(0)
             return ops
 
@@ -502,11 +589,15 @@ def compile_sparse_mla_pp(
             s_accs = [_zero4() for _ in range_constexpr(HALVES)]
             kops = [None] * QK_PAIRS
             m_new = {}
+            load_next = None
             sched = _bp_mfma_schedule(
                 [(g, h) for g in range(PV_GROUPS) for h in range(H4)], QK_PAIRS, HALVES
             )
             if const_expr(Q_READ_AT >= 0):
                 sched = _with_q_reads(sched, Q_REG, Q_LDS, Q_READ_AT)
+            pv_ts = [_py(fx.crd2idx((a[2], a[1]), acc_l)) for a in sched if a[0] == "pv"]
+            packed = {}
+            pv_n = 0
             for n in range_constexpr(len(sched)):
                 act = sched[n]
                 if const_expr(act[0] == "q"):
@@ -519,10 +610,22 @@ def compile_sparse_mla_pp(
                     )
                     if const_expr(prefetch and i == 3 and pr < GM):
                         # the pair's register is drained (read at issue): refill it now
-                        m_new[pr] = kv_g[idx_next, _chunk(pr), None].load()
+                        if const_expr(load_next is None):
+                            load_next = _row_loader(idx_next)
+                        m_new[pr] = load_next(pr)
                 elif const_expr(act[0] == "pv"):
                     t = _py(fx.crd2idx((act[2], act[1]), acc_l))
-                    acc[t] = _mfma_ssa(mma, vt[t], p_b, acc[t])
+                    if const_expr(PACK_AHEAD):
+                        if const_expr(pv_n == 0):
+                            for u in pv_ts[:PACK_AHEAD]:
+                                packed[u] = _pack_vt(vt[u])
+                        acc[t] = _mfma_ssa(mma, packed.pop(t), p_b, acc[t])
+                        if const_expr(pv_n + PACK_AHEAD < len(pv_ts)):
+                            u = pv_ts[pv_n + PACK_AHEAD]
+                            packed[u] = _pack_vt(vt[u])
+                    else:
+                        acc[t] = _mfma_ssa(mma, vt[t], p_b, acc[t])
+                    pv_n += 1
                 else:
                     pr, h = act[1], act[2]
                     if const_expr(kops[pr] is None):
@@ -588,7 +691,10 @@ def compile_sparse_mla_pp(
                 fx.rocdl.sched_barrier(0)
 
         def _softmax(s_acc, m_i, l_i, acc, hooks):
-            scores = [live.select(_elem(s_acc, i), neg_inf) for i in range_constexpr(4)]
+            if const_expr(LIVE_MASK):
+                scores = [live.select(_elem(s_acc, i), neg_inf) for i in range_constexpr(4)]
+            else:
+                scores = [_elem(s_acc, i) for i in range_constexpr(4)]
             m_w = scores[0]
             for i in range_constexpr(1, 4):
                 m_w = (m_w > scores[i]).select(m_w, scores[i])
@@ -608,9 +714,14 @@ def compile_sparse_mla_pp(
             _at(hooks, 2)
             empty = m_n == neg_inf
             p_t = []
+            neg_mc = -(m_n * qk_scale)
             for i in range_constexpr(4):
-                p = empty.select(zero_f, _exp2((scores[i] - m_n) * qk_scale))
-                p_t.append(live.select(p, zero_f))
+                if const_expr(P_FMA):
+                    e = _exp2(fx.fma(scores[i], qk_scale, neg_mc))
+                else:
+                    e = _exp2((scores[i] - m_n) * qk_scale)
+                p = empty.select(zero_f, e)
+                p_t.append(live.select(p, zero_f) if const_expr(LIVE_MASK) else p)
             l_i = l_i * alpha + ((p_t[0] + p_t[1]) + (p_t[2] + p_t[3]))
             _at(hooks, 3)
             p_b = fx.Vector.from_elements([_to_bf16(p) for p in p_t], fx.BFloat16)
@@ -630,19 +741,23 @@ def compile_sparse_mla_pp(
             n_rem = QK_PAIRS - GM
             got = dict(m_new)
             if const_expr(prefetch and G_SPLIT == 1):
+                load = _row_loader(idx_s)
                 for pr in range_constexpr(GM, QK_PAIRS):
-                    got[pr] = kv_g[idx_s, _chunk(pr), None].load()
+                    got[pr] = load(pr)
                 got["idx"] = _load_idx(t + fx.Int32(IDX_AHEAD))
             elif const_expr(prefetch):
                 points = (0, 3) if G_SPLIT == 2 else (0, 1, 2, 3)
                 idx_cur = idx_s
+                loaders = {}
 
                 def _chunk_loads(c):
                     def go():
                         lo = GM + c * n_rem // G_SPLIT
                         hi = GM + (c + 1) * n_rem // G_SPLIT
+                        if const_expr(lo < hi and "row" not in loaders):
+                            loaders["row"] = _row_loader(idx_cur)
                         for pr in range_constexpr(lo, hi):
-                            got[pr] = kv_g[idx_cur, _chunk(pr), None].load()
+                            got[pr] = loaders["row"](pr)
                         if const_expr(c == G_SPLIT - 1):
                             got["idx"] = _load_idx(t + fx.Int32(IDX_AHEAD))
 
@@ -650,6 +765,9 @@ def compile_sparse_mla_pp(
 
                 hooks = {pt: _chunk_loads(c) for c, pt in enumerate(points)}
             _at(hooks, 0)
+            if const_expr(PACK_V):
+                vt = [_pack_vt(c) for c in vt]
+                fx.rocdl.sched_barrier(0)
             s_acc = fx.Vector.from_elements(
                 [_elem(s_acc, i) + peer[i] for i in range_constexpr(4)], fx.Float32
             )
@@ -668,10 +786,13 @@ def compile_sparse_mla_pp(
         l_i = zero_f
         acc = [_zero4() for _ in range_constexpr(N_ACC)]
         # PV(-1) adds 0 x 0: zero operands keep uninitialised registers (NaN) out of acc
-        vt = [
-            fx.Vector.filled(4, 0.0, fx.Float32).to(fx.BFloat16)
-            for _ in range_constexpr(N_ACC)
-        ]
+        if const_expr(PACK_AHEAD):
+            vt = [_zero4() for _ in range_constexpr(N_ACC)]
+        else:
+            vt = [
+                fx.Vector.filled(4, 0.0, fx.Float32).to(fx.BFloat16)
+                for _ in range_constexpr(N_ACC)
+            ]
         p_b = fx.Vector.filled(4, 0.0, fx.Float32).to(fx.BFloat16)
         # idxs[j] holds the index of the next tile = j (mod 2) to gather: PD + 0 / PD + 1
         if const_expr(PD == 2):

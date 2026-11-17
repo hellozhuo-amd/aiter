@@ -39,7 +39,7 @@ def sparse_mla_pp_fwd_flydsl(
     uniform_topk: int | None = None,
     verify_csr: bool = True,
     mfma_transpose: bool = True,
-    q_lds: int = 6,
+    q_lds: int = 3,
     gather_split: int = 4,
     slp: bool = False,
     coalesce: bool = True,
@@ -47,6 +47,12 @@ def sparse_mla_pp_fwd_flydsl(
     q_read_at: int = 2,
     xcd_remap: bool = True,
     gather_in_m: int = 4,
+    imm_gather: bool = True,
+    pin_vt: bool = False,
+    live_mask: bool = True,
+    p_fma: bool = False,
+    pack_ahead: int = 0,
+    pack_in_v: bool = True,
 ):
     """Same contract as sparse_mla_one_query_fwd_flydsl; topk must be a multiple of 32."""
     _require_gfx942()
@@ -73,6 +79,12 @@ def sparse_mla_pp_fwd_flydsl(
         q_read_at=int(q_read_at),
         xcd_remap=bool(xcd_remap),
         gather_in_m=int(gather_in_m),
+        imm_gather=bool(imm_gather),
+        pin_vt=bool(pin_vt),
+        live_mask=bool(live_mask),
+        p_fma=bool(p_fma),
+        pack_ahead=int(pack_ahead),
+        pack_in_v=bool(pack_in_v),
     )
     n_tiles = -(-n_tok // TOKENS_PER_WG)
     idx = flat.to(dtype=torch.int32).contiguous()
